@@ -196,7 +196,7 @@ def create_seat_report(batch_id: int, report: SeatReport):
         raise HTTPException(status_code=503, detail="Database unavailable")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 OLLAMA_TIMEOUT = 120  # seconds per model call; local models can be slow
 OLLAMA_ERRORS = (urllib.error.URLError, TimeoutError)
 # Upper bound on model -> tool -> model round trips for one question.
