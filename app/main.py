@@ -202,13 +202,47 @@ OLLAMA_ERRORS = (urllib.error.URLError, TimeoutError)
 # Upper bound on model -> tool -> model round trips for one question.
 CHAT_MAX_TOOL_ROUNDS = 5
 
+# Most matches a search tool returns.
+CHAT_SEARCH_LIMIT = 5
+
 CHAT_SYSTEM_PROMPT = """You are the assistant for ANchor, a directory of maritime \
 professionals and training courses. Answer using the tools; never invent people, \
-courses, dates or seat numbers. Tools take numeric IDs; if the user gives none, \
-ask for it. Seat counts include how fresh they are: say so when one is "aging" \
-or "stale", and say seats are unknown when there is no report. Today is {today}."""
+courses, dates or seat numbers. When the user gives no ID, search first with a few \
+short keywords (a name, role, service, course name or code), then look up details \
+by the ID you found. The directory records which institute offers each course, \
+not who teaches it. Seat counts include how fresh they are: say so when one is \
+"aging" or "stale", and say seats are unknown when there is no report. \
+Today is {today}."""
 
 CHAT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_people",
+            "description": "Find maritime professionals by name, role or service "
+            f"(e.g. 'chief engineer', 'hull inspection'). Returns up to {CHAT_SEARCH_LIMIT} "
+            "best matches with IDs; call get_person for full details.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Search keywords"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_courses",
+            "description": "Find training courses by name or code (e.g. 'fire fighting', "
+            f"'ECDIS'). Returns up to {CHAT_SEARCH_LIMIT} best matches with IDs and the "
+            "institute; call get_course_batches for batches and seats.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Search keywords"}},
+                "required": ["query"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -238,21 +272,62 @@ CHAT_TOOLS = [
     },
 ]
 
-# Tool name -> (query function, argument name, not-found message).
+# Matches rows containing any of the query's words (plainto_tsquery joins them
+# with AND, which is too strict for model-written queries); ts_rank puts rows
+# matching more of them first.
+SEARCH_ANY_WORD = "CAST(replace(plainto_tsquery('english', %s)::text, '&', '|') AS tsquery)"
+
+def search_people(query: str) -> dict:
+    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        matches = cur.execute(
+            f"""
+            SELECT p.id, p.name, p.role, p.services, p.location
+            FROM people p, {SEARCH_ANY_WORD} q
+            WHERE p.search @@ q
+            ORDER BY ts_rank(p.search, q) DESC, p.id
+            LIMIT %s
+            """,
+            (query, CHAT_SEARCH_LIMIT),
+        ).fetchall()
+    return {"matches": matches}
+
+def search_courses(query: str) -> dict:
+    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        matches = cur.execute(
+            f"""
+            SELECT c.id, c.code, c.name, o.id AS organization_id, o.name AS institute
+            FROM courses c
+            JOIN organizations o ON o.id = c.organization_id,
+                 {SEARCH_ANY_WORD} q
+            WHERE c.search @@ q
+            ORDER BY ts_rank(c.search, q) DESC, c.id
+            LIMIT %s
+            """,
+            (query, CHAT_SEARCH_LIMIT),
+        ).fetchall()
+    return {"matches": matches}
+
+# Tool name -> (query function, argument name, argument type, not-found message).
 CHAT_TOOL_QUERIES = {
-    "get_person": (fetch_person, "person_id", "Person not found"),
-    "get_course_batches": (fetch_course, "course_id", "Course not found"),
+    "get_person": (fetch_person, "person_id", int, "Person not found"),
+    "get_course_batches": (fetch_course, "course_id", int, "Course not found"),
+    "search_people": (search_people, "query", str, None),
+    "search_courses": (search_courses, "query", str, None),
 }
 
 def run_chat_tool(name: str, arguments: dict) -> dict:
     # Bad calls go back to the model as errors so it can retry or explain.
     if name not in CHAT_TOOL_QUERIES:
         return {"error": f"Unknown tool: {name}"}
-    fetch, arg, not_found = CHAT_TOOL_QUERIES[name]
+    fetch, arg, arg_type, not_found = CHAT_TOOL_QUERIES[name]
+    value = arguments.get(arg)
     try:
-        key = int(arguments[arg])
-    except (KeyError, TypeError, ValueError):
-        return {"error": f"{name} needs an integer {arg}"}
+        key = int(value) if arg_type is int else value.strip()
+    except (TypeError, ValueError, AttributeError):
+        key = None
+    if key is None or key == "":
+        kind = "an integer" if arg_type is int else "a non-empty string"
+        return {"error": f"{name} needs {kind} {arg}"}
     result = fetch(key)
     return result if result is not None else {"error": not_found}
 

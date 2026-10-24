@@ -76,3 +76,26 @@ CREATE TABLE IF NOT EXISTS seat_availability (
 
 CREATE INDEX IF NOT EXISTS seat_availability_batch_latest_idx
     ON seat_availability (batch_id, reported_at DESC);
+
+-- Full-text search for the chat tools. Added with ALTER ... IF NOT EXISTS so
+-- re-running this file also updates an existing database.
+
+-- array_to_string is only STABLE, which generated columns don't allow. It is
+-- safe to treat as immutable for text[].
+CREATE OR REPLACE FUNCTION immutable_array_to_string(text[], text) RETURNS text
+    LANGUAGE sql IMMUTABLE AS 'SELECT array_to_string($1, $2)';
+
+ALTER TABLE people ADD COLUMN IF NOT EXISTS search tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', name), 'A') ||
+    setweight(to_tsvector('english', role), 'A') ||
+    setweight(to_tsvector('english', immutable_array_to_string(services, ' ')), 'B')
+) STORED;
+
+CREATE INDEX IF NOT EXISTS people_search_idx ON people USING gin (search);
+
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS search tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', name), 'A') ||
+    setweight(to_tsvector('english', coalesce(code, '')), 'A')
+) STORED;
+
+CREATE INDEX IF NOT EXISTS courses_search_idx ON courses USING gin (search);
