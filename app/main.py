@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 app = FastAPI()
 
@@ -13,4 +13,7 @@ PEOPLE = {
 
 @app.get("/people/{person_id}")
 def get_person(person_id: int):
-    return PEOPLE[person_id]
+    person = PEOPLE.get(person_id)
+    if person is None:
+        raise HTTPException(status_code=404, detail="Person not found")
+    return person
