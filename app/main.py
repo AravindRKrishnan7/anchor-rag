@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 import psycopg
 from fastapi import FastAPI, HTTPException
@@ -8,6 +9,10 @@ from psycopg_pool import PoolTimeout
 from app.db import pool
 
 DB_ERRORS = (psycopg.Error, PoolTimeout)
+
+# Seat counts older than these are flagged so clients can warn users.
+SEATS_FRESH_FOR = timedelta(days=1)
+SEATS_STALE_AFTER = timedelta(days=7)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -58,3 +63,76 @@ def get_person(person_id: int):
     if person is None:
         raise HTTPException(status_code=404, detail="Person not found")
     return person
+
+def seat_freshness(age: timedelta | None) -> str:
+    if age is None:
+        return "unknown"
+    if age <= SEATS_FRESH_FOR:
+        return "fresh"
+    if age <= SEATS_STALE_AFTER:
+        return "aging"
+    return "stale"
+
+@app.get("/courses/{course_id}")
+def get_course(course_id: int):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            course = cur.execute(
+                """
+                SELECT c.id, c.code, c.name, c.duration_days, c.fee_inr, c.description,
+                       o.id AS organization_id, o.name AS institute
+                FROM courses c
+                JOIN organizations o ON o.id = c.organization_id
+                WHERE c.id = %s
+                """,
+                (course_id,),
+            ).fetchone()
+            if course is not None:
+                batches = cur.execute(
+                    """
+                    SELECT b.id, b.start_date, b.end_date, b.capacity, b.location,
+                           s.seats_available, s.reported_at,
+                           now() - s.reported_at AS age,
+                           p.id AS reported_by_id, p.name AS reported_by_name
+                    FROM course_batches b
+                    LEFT JOIN LATERAL (
+                        SELECT seats_available, reported_at, reported_by_person_id
+                        FROM seat_availability
+                        WHERE batch_id = b.id
+                        ORDER BY reported_at DESC
+                        LIMIT 1
+                    ) s ON true
+                    LEFT JOIN people p ON p.id = s.reported_by_person_id
+                    WHERE b.course_id = %s
+                    ORDER BY b.start_date
+                    """,
+                    (course_id,),
+                ).fetchall()
+    except DB_ERRORS:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    if course is None:
+        raise HTTPException(status_code=404, detail="Course not found")
+    course["batches"] = [
+        {
+            "id": b["id"],
+            "start_date": b["start_date"],
+            "end_date": b["end_date"],
+            "capacity": b["capacity"],
+            "location": b["location"],
+            "seats": {
+                "available": b["seats_available"],
+                "updated_at": b["reported_at"],
+                "reported_by": (
+                    {"id": b["reported_by_id"], "name": b["reported_by_name"]}
+                    if b["reported_by_id"] is not None
+                    else None
+                ),
+                "age_hours": (
+                    round(b["age"].total_seconds() / 3600, 1) if b["age"] is not None else None
+                ),
+                "freshness": seat_freshness(b["age"]),
+            },
+        }
+        for b in batches
+    ]
+    return course
