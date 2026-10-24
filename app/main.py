@@ -1,10 +1,12 @@
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from typing import Literal
 
 import psycopg
 from fastapi import FastAPI, HTTPException
 from psycopg.rows import dict_row
 from psycopg_pool import PoolTimeout
+from pydantic import BaseModel, Field
 
 from app.db import pool
 
@@ -91,12 +93,12 @@ def get_course(course_id: int):
                 batches = cur.execute(
                     """
                     SELECT b.id, b.start_date, b.end_date, b.capacity, b.location,
-                           s.seats_available, s.reported_at,
+                           s.seats_available, s.source, s.reported_at,
                            now() - s.reported_at AS age,
                            p.id AS reported_by_id, p.name AS reported_by_name
                     FROM course_batches b
                     LEFT JOIN LATERAL (
-                        SELECT seats_available, reported_at, reported_by_person_id
+                        SELECT seats_available, source, reported_at, reported_by_person_id
                         FROM seat_availability
                         WHERE batch_id = b.id
                         ORDER BY reported_at DESC
@@ -122,6 +124,7 @@ def get_course(course_id: int):
             "seats": {
                 "available": b["seats_available"],
                 "updated_at": b["reported_at"],
+                "source": b["source"],
                 "reported_by": (
                     {"id": b["reported_by_id"], "name": b["reported_by_name"]}
                     if b["reported_by_id"] is not None
@@ -136,3 +139,43 @@ def get_course(course_id: int):
         for b in batches
     ]
     return course
+
+class SeatReport(BaseModel):
+    seats_available: int = Field(ge=0)
+    source: Literal["manual", "form", "sync"]
+    reported_by_person_id: int | None = None
+
+@app.post("/batches/{batch_id}/seat-reports", status_code=201)
+def create_seat_report(batch_id: int, report: SeatReport):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            # FOR SHARE stops capacity changing between the check and the insert.
+            batch = cur.execute(
+                "SELECT capacity FROM course_batches WHERE id = %s FOR SHARE",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                raise HTTPException(status_code=404, detail="Batch not found")
+            if report.seats_available > batch["capacity"]:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"seats_available ({report.seats_available}) exceeds "
+                    f"batch capacity ({batch['capacity']})",
+                )
+            if report.reported_by_person_id is not None and cur.execute(
+                "SELECT 1 FROM people WHERE id = %s", (report.reported_by_person_id,)
+            ).fetchone() is None:
+                raise HTTPException(status_code=422, detail="Reporting person not found")
+            return cur.execute(
+                """
+                INSERT INTO seat_availability
+                    (batch_id, seats_available, source, reported_by_person_id)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, batch_id, seats_available, source, reported_at,
+                          reported_by_person_id
+                """,
+                (batch_id, report.seats_available, report.source,
+                 report.reported_by_person_id),
+            ).fetchone()
+    except DB_ERRORS:
+        raise HTTPException(status_code=503, detail="Database unavailable")

@@ -73,13 +73,13 @@ ON CONFLICT (id) DO NOTHING;
 
 -- Report ages vary so the API shows fresh, aging and stale data.
 -- Batch 5 has no report yet.
-INSERT INTO seat_availability (id, batch_id, seats_available, reported_at, reported_by_person_id) VALUES
-    (1, 1, 12, now() - interval '9 days',  9),
-    (2, 1,  4, now() - interval '3 hours', 9),
-    (3, 2, 30, now() - interval '4 days',  9),
-    (4, 3,  7, now() - interval '12 days', 9),
-    (5, 4,  2, now() - interval '20 minutes', 10),
-    (6, 6,  0, now() - interval '1 day',   10)
+INSERT INTO seat_availability (id, batch_id, seats_available, source, reported_at, reported_by_person_id) VALUES
+    (1, 1, 12, 'manual', now() - interval '9 days',     9),
+    (2, 1,  4, 'manual', now() - interval '3 hours',    9),
+    (3, 2, 30, 'form',   now() - interval '4 days',     9),
+    (4, 3,  7, 'manual', now() - interval '12 days',    9),
+    (5, 4,  2, 'sync',   now() - interval '20 minutes', NULL),
+    (6, 6,  0, 'form',   now() - interval '1 day',      10)
 ON CONFLICT (id) DO NOTHING;
 
 -- Move identity counters past the seeded ids so new inserts don't collide.
