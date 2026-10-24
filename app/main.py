@@ -1,9 +1,14 @@
+import json
+import os
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Literal
 
 import psycopg
 from fastapi import FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
 from psycopg.rows import dict_row
 from psycopg_pool import PoolTimeout
 from pydantic import BaseModel, Field
@@ -40,26 +45,30 @@ def db_health():
         raise HTTPException(status_code=503, detail="Database unavailable")
     return {"status": "ok", "postgres": postgres, "pgvector": row[0] if row else None}
 
+def fetch_person(person_id: int) -> dict | None:
+    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        person = cur.execute(
+            "SELECT id, name, role, services, location, bio FROM people WHERE id = %s",
+            (person_id,),
+        ).fetchone()
+        if person is not None:
+            person["employment"] = cur.execute(
+                """
+                SELECT e.title, e.start_date, e.end_date,
+                       o.id AS organization_id, o.name AS organization, o.org_type
+                FROM employment e
+                JOIN organizations o ON o.id = e.organization_id
+                WHERE e.person_id = %s
+                ORDER BY e.end_date IS NOT NULL, e.start_date DESC
+                """,
+                (person_id,),
+            ).fetchall()
+    return person
+
 @app.get("/people/{person_id}")
 def get_person(person_id: int):
     try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            person = cur.execute(
-                "SELECT id, name, role, services, location, bio FROM people WHERE id = %s",
-                (person_id,),
-            ).fetchone()
-            if person is not None:
-                person["employment"] = cur.execute(
-                    """
-                    SELECT e.title, e.start_date, e.end_date,
-                           o.id AS organization_id, o.name AS organization, o.org_type
-                    FROM employment e
-                    JOIN organizations o ON o.id = e.organization_id
-                    WHERE e.person_id = %s
-                    ORDER BY e.end_date IS NOT NULL, e.start_date DESC
-                    """,
-                    (person_id,),
-                ).fetchall()
+        person = fetch_person(person_id)
     except DB_ERRORS:
         raise HTTPException(status_code=503, detail="Database unavailable")
     if person is None:
@@ -75,45 +84,41 @@ def seat_freshness(age: timedelta | None) -> str:
         return "aging"
     return "stale"
 
-@app.get("/courses/{course_id}")
-def get_course(course_id: int):
-    try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            course = cur.execute(
+def fetch_course(course_id: int) -> dict | None:
+    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        course = cur.execute(
+            """
+            SELECT c.id, c.code, c.name, c.duration_days, c.fee_inr, c.description,
+                   o.id AS organization_id, o.name AS institute
+            FROM courses c
+            JOIN organizations o ON o.id = c.organization_id
+            WHERE c.id = %s
+            """,
+            (course_id,),
+        ).fetchone()
+        if course is not None:
+            batches = cur.execute(
                 """
-                SELECT c.id, c.code, c.name, c.duration_days, c.fee_inr, c.description,
-                       o.id AS organization_id, o.name AS institute
-                FROM courses c
-                JOIN organizations o ON o.id = c.organization_id
-                WHERE c.id = %s
+                SELECT b.id, b.start_date, b.end_date, b.capacity, b.location,
+                       s.seats_available, s.source, s.reported_at,
+                       now() - s.reported_at AS age,
+                       p.id AS reported_by_id, p.name AS reported_by_name
+                FROM course_batches b
+                LEFT JOIN LATERAL (
+                    SELECT seats_available, source, reported_at, reported_by_person_id
+                    FROM seat_availability
+                    WHERE batch_id = b.id
+                    ORDER BY reported_at DESC
+                    LIMIT 1
+                ) s ON true
+                LEFT JOIN people p ON p.id = s.reported_by_person_id
+                WHERE b.course_id = %s
+                ORDER BY b.start_date
                 """,
                 (course_id,),
-            ).fetchone()
-            if course is not None:
-                batches = cur.execute(
-                    """
-                    SELECT b.id, b.start_date, b.end_date, b.capacity, b.location,
-                           s.seats_available, s.source, s.reported_at,
-                           now() - s.reported_at AS age,
-                           p.id AS reported_by_id, p.name AS reported_by_name
-                    FROM course_batches b
-                    LEFT JOIN LATERAL (
-                        SELECT seats_available, source, reported_at, reported_by_person_id
-                        FROM seat_availability
-                        WHERE batch_id = b.id
-                        ORDER BY reported_at DESC
-                        LIMIT 1
-                    ) s ON true
-                    LEFT JOIN people p ON p.id = s.reported_by_person_id
-                    WHERE b.course_id = %s
-                    ORDER BY b.start_date
-                    """,
-                    (course_id,),
-                ).fetchall()
-    except DB_ERRORS:
-        raise HTTPException(status_code=503, detail="Database unavailable")
+            ).fetchall()
     if course is None:
-        raise HTTPException(status_code=404, detail="Course not found")
+        return None
     course["batches"] = [
         {
             "id": b["id"],
@@ -138,6 +143,16 @@ def get_course(course_id: int):
         }
         for b in batches
     ]
+    return course
+
+@app.get("/courses/{course_id}")
+def get_course(course_id: int):
+    try:
+        course = fetch_course(course_id)
+    except DB_ERRORS:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    if course is None:
+        raise HTTPException(status_code=404, detail="Course not found")
     return course
 
 class SeatReport(BaseModel):
@@ -179,3 +194,112 @@ def create_seat_report(batch_id: int, report: SeatReport):
             ).fetchone()
     except DB_ERRORS:
         raise HTTPException(status_code=503, detail="Database unavailable")
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
+OLLAMA_TIMEOUT = 120  # seconds per model call; local models can be slow
+OLLAMA_ERRORS = (urllib.error.URLError, TimeoutError)
+# Upper bound on model -> tool -> model round trips for one question.
+CHAT_MAX_TOOL_ROUNDS = 5
+
+CHAT_SYSTEM_PROMPT = """You are the assistant for ANchor, a directory of maritime \
+professionals and training courses. Answer using the tools; never invent people, \
+courses, dates or seat numbers. Tools take numeric IDs; if the user gives none, \
+ask for it. Seat counts include how fresh they are: say so when one is "aging" \
+or "stale", and say seats are unknown when there is no report. Today is {today}."""
+
+CHAT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_person",
+            "description": "Look up a maritime professional by ID: role, services, "
+            "location, bio and employment history.",
+            "parameters": {
+                "type": "object",
+                "properties": {"person_id": {"type": "integer", "description": "Person ID"}},
+                "required": ["person_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_course_batches",
+            "description": "Look up a training course by ID: institute, fee, duration "
+            "and its batches with dates, capacity, latest seat availability and how "
+            "fresh that seat count is.",
+            "parameters": {
+                "type": "object",
+                "properties": {"course_id": {"type": "integer", "description": "Course ID"}},
+                "required": ["course_id"],
+            },
+        },
+    },
+]
+
+# Tool name -> (query function, argument name, not-found message).
+CHAT_TOOL_QUERIES = {
+    "get_person": (fetch_person, "person_id", "Person not found"),
+    "get_course_batches": (fetch_course, "course_id", "Course not found"),
+}
+
+def run_chat_tool(name: str, arguments: dict) -> dict:
+    # Bad calls go back to the model as errors so it can retry or explain.
+    if name not in CHAT_TOOL_QUERIES:
+        return {"error": f"Unknown tool: {name}"}
+    fetch, arg, not_found = CHAT_TOOL_QUERIES[name]
+    try:
+        key = int(arguments[arg])
+    except (KeyError, TypeError, ValueError):
+        return {"error": f"{name} needs an integer {arg}"}
+    result = fetch(key)
+    return result if result is not None else {"error": not_found}
+
+def ollama_chat(messages: list[dict]) -> dict:
+    request = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=json.dumps(
+            {"model": OLLAMA_MODEL, "messages": messages, "tools": CHAT_TOOLS, "stream": False}
+        ).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
+        return json.load(response)["message"]
+
+class ChatRequest(BaseModel):
+    question: str = Field(min_length=1)
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+    messages = [
+        {"role": "system", "content": CHAT_SYSTEM_PROMPT.format(today=date.today())},
+        {"role": "user", "content": request.question},
+    ]
+    tool_calls = []
+    try:
+        for _ in range(CHAT_MAX_TOOL_ROUNDS + 1):
+            reply = ollama_chat(messages)
+            messages.append(reply)
+            if not reply.get("tool_calls"):
+                return {"answer": reply.get("content", ""), "tool_calls": tool_calls}
+            for call in reply["tool_calls"]:
+                name = call["function"]["name"]
+                arguments = call["function"].get("arguments") or {}
+                result = run_chat_tool(name, arguments)
+                tool_calls.append({"name": name, "arguments": arguments})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_name": name,
+                        "content": json.dumps(jsonable_encoder(result)),
+                    }
+                )
+    except DB_ERRORS:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    except OLLAMA_ERRORS:
+        raise HTTPException(status_code=503, detail="Language model unavailable")
+    raise HTTPException(
+        status_code=502,
+        detail=f"Model was still calling tools after {CHAT_MAX_TOOL_ROUNDS} rounds",
+    )
