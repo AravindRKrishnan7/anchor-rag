@@ -14,6 +14,7 @@ from psycopg_pool import PoolTimeout
 from pydantic import BaseModel, Field
 
 from app.db import pool
+from app.embeddings import EMBED_MODEL, OLLAMA_URL, embed_query, to_pgvector
 
 DB_ERRORS = (psycopg.Error, PoolTimeout)
 
@@ -195,7 +196,6 @@ def create_seat_report(batch_id: int, report: SeatReport):
     except DB_ERRORS:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 OLLAMA_TIMEOUT = 120  # seconds per model call; local models can be slow
 OLLAMA_ERRORS = (urllib.error.URLError, TimeoutError)
@@ -204,6 +204,10 @@ CHAT_MAX_TOOL_ROUNDS = 5
 
 # Most matches a search tool returns.
 CHAT_SEARCH_LIMIT = 5
+# Candidates each of vector and full-text search feed into rank fusion, and
+# the standard Reciprocal Rank Fusion constant (dampens the gap between ranks).
+DOCUMENT_CANDIDATES = 20
+RRF_K = 60
 
 CHAT_SYSTEM_PROMPT = """You are the assistant for ANchor, a directory of maritime \
 professionals and training courses. Answer using the tools; never invent people, \
@@ -212,6 +216,8 @@ short keywords (a name, role, service, course name or code), then look up detail
 by the ID you found. The directory records which institute offers each course, \
 not who teaches it. Seat counts include how fresh they are: say so when one is \
 "aging" or "stale", and say seats are unknown when there is no report. \
+For what people have said about their work, experience or advice, use \
+search_documents and attribute each point to the person who said it. \
 Today is {today}."""
 
 CHAT_TOOLS = [
@@ -239,6 +245,21 @@ CHAT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Search keywords"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_documents",
+            "description": "Search interview transcripts for what maritime professionals "
+            "said about a topic: experiences, opinions, advice. Matches by meaning, so "
+            "describe the topic in a short phrase or question. Returns up to "
+            f"{CHAT_SEARCH_LIMIT} passages with the speaker's name and interview title.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Topic or question"}},
                 "required": ["query"],
             },
         },
@@ -307,12 +328,59 @@ def search_courses(query: str) -> dict:
         ).fetchall()
     return {"matches": matches}
 
+# Hybrid search: vector similarity finds passages with the same meaning,
+# full-text finds exact terms (codes, names). Reciprocal Rank Fusion scores
+# each passage by 1/(RRF_K + rank) in each list, so ones both agree on win.
+# Full-text requires every word here (unlike SEARCH_ANY_WORD): in long
+# passages, matching any one word of a question ("vessel", "watch") is noise
+# that would outvote the vector ranking.
+def search_documents(query: str) -> dict:
+    vector = to_pgvector(embed_query(query))
+    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        matches = cur.execute(
+            """
+            WITH vec AS (
+                SELECT id, row_number() OVER (ORDER BY embedding <=> %(vector)s::vector) AS rank
+                FROM chunks
+                WHERE embedding_model = %(model)s
+                ORDER BY embedding <=> %(vector)s::vector
+                LIMIT %(candidates)s
+            ),
+            fts AS (
+                SELECT c.id, row_number() OVER (ORDER BY ts_rank(c.search, q) DESC) AS rank
+                FROM chunks c, websearch_to_tsquery('english', %(query)s) q
+                WHERE c.search @@ q
+                ORDER BY ts_rank(c.search, q) DESC
+                LIMIT %(candidates)s
+            ),
+            fused AS (
+                SELECT coalesce(vec.id, fts.id) AS id,
+                       coalesce(1.0 / (%(k)s + vec.rank), 0)
+                           + coalesce(1.0 / (%(k)s + fts.rank), 0) AS score
+                FROM vec FULL OUTER JOIN fts ON fts.id = vec.id
+            )
+            SELECT c.id AS chunk_id, p.id AS person_id, p.name AS person_name,
+                   i.title AS interview_title, i.interviewed_on, c.content AS text,
+                   round(f.score, 4) AS score
+            FROM fused f
+            JOIN chunks c ON c.id = f.id
+            JOIN people p ON p.id = c.person_id
+            JOIN interviews i ON i.id = c.interview_id
+            ORDER BY f.score DESC, c.id
+            LIMIT %(limit)s
+            """,
+            {"vector": vector, "model": EMBED_MODEL, "query": query,
+             "candidates": DOCUMENT_CANDIDATES, "k": RRF_K, "limit": CHAT_SEARCH_LIMIT},
+        ).fetchall()
+    return {"matches": matches}
+
 # Tool name -> (query function, argument name, argument type, not-found message).
 CHAT_TOOL_QUERIES = {
     "get_person": (fetch_person, "person_id", int, "Person not found"),
     "get_course_batches": (fetch_course, "course_id", int, "Course not found"),
     "search_people": (search_people, "query", str, None),
     "search_courses": (search_courses, "query", str, None),
+    "search_documents": (search_documents, "query", str, None),
 }
 
 def run_chat_tool(name: str, arguments: dict) -> dict:
