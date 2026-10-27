@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
@@ -231,10 +232,22 @@ not who teaches it. Seat counts include how fresh they are: say so when one is \
 "aging" or "stale", and say seats are unknown when there is no report. \
 For what people have said about their work, experience or advice, use \
 search_documents and attribute each point to the person who said it. \
-IDs are for your tool calls only: never show database IDs (such as "ID 1") \
-in answers to users. Earlier turns of the conversation name people and courses \
-but don't include tool results: for a follow-up, look them up again by name \
-rather than answering from memory. Today is {today}."""
+Today is {today}."""
+
+# Rules the model doesn't follow reliably are enforced on its answer instead:
+# quotes must appear in this turn's search_documents results, and database
+# IDs are removed.
+# A quote is "..." or curly-quoted text of at least this many words (shorter
+# ones are usually terms like "aging"), or a Markdown block quote line.
+QUOTE_MIN_WORDS = 3
+INLINE_QUOTE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
+BLOCK_QUOTE = re.compile(r"^(>\s?)(.*)$", re.M)
+UNVERIFIED_QUOTE = "[quote removed: not found in the interview transcripts]"
+# "(ID 1)", "(person ID: 1)", then any remaining "course ID 456".
+ID_IN_PARENS = re.compile(r"\s*\((?:person |course |batch )?IDs? ?:? ?#?\d+\)", re.I)
+ID_MENTION = re.compile(r"\s*\b(?:person |course |batch )?IDs? ?:? ?#?\d+\b", re.I)
+# Characters of the previous exchange used to search transcripts on a follow-up.
+CHAT_FOLLOW_UP_CONTEXT_CHARS = 500
 
 CHAT_TOOLS = [
     {
@@ -426,6 +439,49 @@ def ollama_chat(messages: list[dict]) -> dict:
     with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
         return json.load(response)["message"]
 
+def normalize_quote(text: str) -> str:
+    text = text.translate({0x2018: "'", 0x2019: "'", 0x201C: '"', 0x201D: '"'})
+    return re.sub(r"\s+", " ", text).strip(" .,;:!?\"'*_").lower()
+
+def quote_found(quote: str, sources: list[str]) -> bool:
+    # A quote shortened with "..." must match piece by piece.
+    pieces = [normalize_quote(p) for p in re.split(r"\.\.\.|…", quote)]
+    return all(any(piece in source for source in sources) for piece in pieces if piece)
+
+def is_quote(text: str) -> bool:
+    return len(text.split()) >= QUOTE_MIN_WORDS
+
+# Replaces quotes that aren't in sources (passages and interview titles from
+# this turn's search_documents calls). Returns the answer and removed quotes.
+def remove_unverified_quotes(answer: str, sources: list[str]) -> tuple[str, list[str]]:
+    sources = [normalize_quote(s) for s in sources]
+    removed = []
+
+    def check_block(match: re.Match) -> str:
+        line = match[2].strip()
+        # Leave attribution lines ("— Ravi Menon") and lines with inline
+        # quotes, which the inline check handles.
+        if not is_quote(line) or line[0] in "—–-" or INLINE_QUOTE.search(line):
+            return match[0]
+        if quote_found(line, sources):
+            return match[0]
+        removed.append(line)
+        return match[1] + UNVERIFIED_QUOTE
+
+    def check_inline(match: re.Match) -> str:
+        quote = match[1] or match[2]
+        if not is_quote(quote) or quote_found(quote, sources):
+            return match[0]
+        removed.append(quote)
+        return UNVERIFIED_QUOTE
+
+    answer = BLOCK_QUOTE.sub(check_block, answer)
+    answer = INLINE_QUOTE.sub(check_inline, answer)
+    return answer, removed
+
+def remove_ids(answer: str) -> str:
+    return ID_MENTION.sub("", ID_IN_PARENS.sub("", answer))
+
 # Only user and assistant turns, so a client can't inject system or tool messages.
 class ChatTurn(BaseModel):
     role: Literal["user", "assistant"]
@@ -446,24 +502,52 @@ def chat(request: ChatRequest):
         {"role": "user", "content": request.question},
     ]
     tool_calls = []
+    quote_sources = []
+
+    def call_tool(name: str, arguments: dict, automatic: bool = False):
+        result = run_chat_tool(name, arguments)
+        tool_calls.append({"name": name, "arguments": arguments, "automatic": automatic})
+        if name == "search_documents":
+            for match in result.get("matches", []):
+                quote_sources.extend([match["text"], match["interview_title"]])
+        messages.append(
+            {"role": "tool", "tool_name": name, "content": json.dumps(jsonable_encoder(result))}
+        )
+
     try:
+        if request.history:
+            # A follow-up often asks about something an earlier answer
+            # described, which the model would retell from memory. Searching
+            # the transcripts for the last exchange plus the new question gives
+            # it the real passages, as if it had called the tool itself.
+            context = " ".join(
+                turn.content[:CHAT_FOLLOW_UP_CONTEXT_CHARS] for turn in request.history[-2:]
+            )
+            arguments = {"query": f"{context} {request.question}"}
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "search_documents", "arguments": arguments}}
+                    ],
+                }
+            )
+            call_tool("search_documents", arguments, automatic=True)
         for _ in range(CHAT_MAX_TOOL_ROUNDS + 1):
             reply = ollama_chat(messages)
             messages.append(reply)
             if not reply.get("tool_calls"):
-                return {"answer": reply.get("content", ""), "tool_calls": tool_calls}
-            for call in reply["tool_calls"]:
-                name = call["function"]["name"]
-                arguments = call["function"].get("arguments") or {}
-                result = run_chat_tool(name, arguments)
-                tool_calls.append({"name": name, "arguments": arguments})
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_name": name,
-                        "content": json.dumps(jsonable_encoder(result)),
-                    }
+                answer, removed = remove_unverified_quotes(
+                    reply.get("content", ""), quote_sources
                 )
+                return {
+                    "answer": remove_ids(answer),
+                    "tool_calls": tool_calls,
+                    "removed_quotes": removed,
+                }
+            for call in reply["tool_calls"]:
+                call_tool(call["function"]["name"], call["function"].get("arguments") or {})
     except DB_ERRORS:
         raise HTTPException(status_code=503, detail="Database unavailable")
     except OLLAMA_ERRORS:
