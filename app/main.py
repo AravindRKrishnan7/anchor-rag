@@ -210,6 +210,10 @@ OLLAMA_TIMEOUT = 120  # seconds per model call; local models can be slow
 OLLAMA_ERRORS = (urllib.error.URLError, TimeoutError)
 # Upper bound on model -> tool -> model round trips for one question.
 CHAT_MAX_TOOL_ROUNDS = 5
+# Earlier turns kept for follow-up questions (3 question/answer pairs), each
+# cut to this many characters so long answers don't slow the model down.
+CHAT_HISTORY_MESSAGES = 6
+CHAT_HISTORY_CHARS = 2000
 
 # Most matches a search tool returns.
 CHAT_SEARCH_LIMIT = 5
@@ -228,7 +232,9 @@ not who teaches it. Seat counts include how fresh they are: say so when one is \
 For what people have said about their work, experience or advice, use \
 search_documents and attribute each point to the person who said it. \
 IDs are for your tool calls only: never show database IDs (such as "ID 1") \
-in answers to users. Today is {today}."""
+in answers to users. Earlier turns of the conversation name people and courses \
+but don't include tool results: for a follow-up, look them up again by name \
+rather than answering from memory. Today is {today}."""
 
 CHAT_TOOLS = [
     {
@@ -420,13 +426,23 @@ def ollama_chat(messages: list[dict]) -> dict:
     with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
         return json.load(response)["message"]
 
+# Only user and assistant turns, so a client can't inject system or tool messages.
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1)
+    history: list[ChatTurn] = []
 
 @app.post("/chat")
 def chat(request: ChatRequest):
     messages = [
         {"role": "system", "content": CHAT_SYSTEM_PROMPT.format(today=date.today())},
+        *(
+            {"role": turn.role, "content": turn.content[:CHAT_HISTORY_CHARS]}
+            for turn in request.history[-CHAT_HISTORY_MESSAGES:]
+        ),
         {"role": "user", "content": request.question},
     ]
     tool_calls = []

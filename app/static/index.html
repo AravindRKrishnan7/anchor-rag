@@ -44,6 +44,23 @@
   .bar svg { width: 30px; height: 30px; flex: none; }
   .bar h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: 0.04em; }
   .bar p { margin: 0 0 0 auto; font-size: 13px; color: #b9cde0; }
+  .reset {
+    font: inherit;
+    font-size: 13px;
+    color: #fff;
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 8px;
+    padding: 5px 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .reset:hover { border-color: #fff; }
+  .reset:disabled { opacity: 0.45; cursor: not-allowed; }
+  @media (max-width: 520px) {
+    .bar p { display: none; }
+    .reset { margin-left: auto; }
+  }
 
   main {
     flex: 1;
@@ -168,6 +185,7 @@
     </svg>
     <h1>Anchor</h1>
     <p>Maritime professionals &amp; training</p>
+    <button class="reset" id="reset" type="button">New conversation</button>
   </div>
 </header>
 
@@ -190,7 +208,7 @@
     <textarea id="input" rows="1" placeholder="Ask a question…" aria-label="Your question" required></textarea>
     <button class="send" id="send" type="submit">Send</button>
   </form>
-  <div class="hint">Enter to send · Shift+Enter for a new line · each question is answered on its own</div>
+  <div class="hint">Enter to send · Shift+Enter for a new line</div>
 </footer>
 
 <script>
@@ -200,6 +218,12 @@ const send = document.getElementById("send");
 const log = document.getElementById("log");
 const scroller = document.getElementById("scroller");
 const welcome = document.getElementById("welcome");
+const reset = document.getElementById("reset");
+
+// Earlier questions and answers, sent with each request so follow-ups work.
+// The server keeps the same number; sending more would just be dropped.
+const HISTORY_MESSAGES = 6;
+const history = [];
 
 function escapeHtml(text) {
   return text.replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
@@ -246,7 +270,7 @@ function renderMarkdown(source) {
 }
 
 function addMessage(kind, html) {
-  welcome?.remove();
+  welcome.remove();
   const el = document.createElement("div");
   el.className = `msg ${kind}`;
   el.innerHTML = html;
@@ -258,6 +282,7 @@ function addMessage(kind, html) {
 function setBusy(busy) {
   input.disabled = busy;
   send.disabled = busy;
+  reset.disabled = busy;
   if (!busy) input.focus();
 }
 
@@ -278,7 +303,7 @@ async function ask(question) {
       response = await fetch("/chat", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({question}),
+        body: JSON.stringify({question, history: history.slice(-HISTORY_MESSAGES)}),
       });
     } catch {
       throw new Error("Couldn't reach the server. Is it running?");
@@ -289,6 +314,10 @@ async function ask(question) {
       throw new Error(`Sorry, something went wrong: ${detail}.`);
     }
     pending.innerHTML = renderMarkdown(data.answer || "(No answer was returned.)");
+    // Only completed exchanges go into history, never a failed question.
+    if (data.answer) {
+      history.push({role: "user", content: question}, {role: "assistant", content: data.answer});
+    }
   } catch (error) {
     pending.classList.add("error");
     pending.textContent = error.message;
@@ -320,6 +349,13 @@ input.addEventListener("input", () => {
 });
 document.querySelectorAll(".examples button").forEach(button => {
   button.addEventListener("click", () => ask(button.textContent));
+});
+reset.addEventListener("click", () => {
+  history.length = 0;
+  log.replaceChildren(welcome);
+  input.value = "";
+  input.style.height = "";
+  input.focus();
 });
 input.focus();
 </script>
