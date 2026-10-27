@@ -218,7 +218,8 @@ not who teaches it. Seat counts include how fresh they are: say so when one is \
 "aging" or "stale", and say seats are unknown when there is no report. \
 For what people have said about their work, experience or advice, use \
 search_documents and attribute each point to the person who said it. \
-Today is {today}."""
+IDs are for your tool calls only: never show database IDs (such as "ID 1") \
+in answers to users. Today is {today}."""
 
 CHAT_TOOLS = [
     {
