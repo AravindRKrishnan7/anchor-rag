@@ -4,11 +4,13 @@ import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Literal
 
 import psycopg
 from fastapi import FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import FileResponse
 from psycopg.rows import dict_row
 from psycopg_pool import PoolTimeout
 from pydantic import BaseModel, Field
@@ -29,6 +31,13 @@ async def lifespan(app: FastAPI):
     pool.close()
 
 app = FastAPI(lifespan=lifespan)
+
+INDEX_HTML = Path(__file__).parent / "static" / "index.html"
+
+# Demo chat page; read per request so edits show up on refresh.
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(INDEX_HTML)
 
 @app.get("/health")
 def health():
