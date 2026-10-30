@@ -17,7 +17,7 @@ from psycopg_pool import PoolTimeout
 from pydantic import BaseModel, Field
 
 from app.db import pool
-from app.embeddings import EMBED_MODEL, OLLAMA_URL, embed_query, to_pgvector
+from app.embeddings import EMBED_MODEL, embed_query, to_pgvector
 
 DB_ERRORS = (psycopg.Error, PoolTimeout)
 
@@ -28,6 +28,10 @@ SEATS_STALE_AFTER = timedelta(days=7)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     pool.open(wait=False)
+    try:
+        get_chat_profiles()
+    except DB_ERRORS:
+        pass  # loaded on the first chat instead
     yield
     pool.close()
 
@@ -206,9 +210,12 @@ def create_seat_report(batch_id: int, report: SeatReport):
     except DB_ERRORS:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
-OLLAMA_TIMEOUT = 120  # seconds per model call; local models can be slow
-OLLAMA_ERRORS = (urllib.error.URLError, TimeoutError)
+# Chat model, via DeepSeek's OpenAI-compatible API. Embeddings stay on Ollama.
+DEEPSEEK_URL = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+CHAT_TIMEOUT = 60  # seconds per model call
+CHAT_MODEL_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError)
 # Upper bound on model -> tool -> model round trips for one question.
 CHAT_MAX_TOOL_ROUNDS = 5
 # Earlier turns kept for follow-up questions (3 question/answer pairs), each
@@ -224,15 +231,22 @@ DOCUMENT_CANDIDATES = 20
 RRF_K = 60
 
 CHAT_SYSTEM_PROMPT = """You are the assistant for ANchor, a directory of maritime \
-professionals and training courses. Answer using the tools; never invent people, \
-courses, dates or seat numbers. When the user gives no ID, search first with a few \
-short keywords (a name, role, service, course name or code), then look up details \
-by the ID you found. The directory records which institute offers each course, \
+professionals and training courses. Answer only from the profiles below and from \
+tool results; never invent people, courses, dates or seat numbers. If neither has \
+the answer, say exactly: I don't have that information.
+
+The profiles list everyone in the directory with their jobs. For courses, seats \
+and what people said in interviews, use the tools. When the user gives no ID, \
+search first with a few short keywords (a name, role, service, course name or \
+code), then look up details by the ID you found. The directory records which institute offers each course, \
 not who teaches it. Seat counts include how fresh they are: say so when one is \
 "aging" or "stale", and say seats are unknown when there is no report. \
 For what people have said about their work, experience or advice, use \
 search_documents and attribute each point to the person who said it. \
-Today is {today}."""
+Today is {today}.
+
+Profiles:
+{profiles}"""
 
 # Rules the model doesn't follow reliably are enforced on its answer instead:
 # quotes must appear in this turn's search_documents results, and database
@@ -412,10 +426,12 @@ CHAT_TOOL_QUERIES = {
     "search_documents": (search_documents, "query", str, None),
 }
 
-def run_chat_tool(name: str, arguments: dict) -> dict:
+def run_chat_tool(name: str, arguments: dict | None) -> dict:
     # Bad calls go back to the model as errors so it can retry or explain.
     if name not in CHAT_TOOL_QUERIES:
         return {"error": f"Unknown tool: {name}"}
+    if not isinstance(arguments, dict):
+        return {"error": "Arguments must be a JSON object"}
     fetch, arg, arg_type, not_found = CHAT_TOOL_QUERIES[name]
     value = arguments.get(arg)
     try:
@@ -428,16 +444,70 @@ def run_chat_tool(name: str, arguments: dict) -> dict:
     result = fetch(key)
     return result if result is not None else {"error": not_found}
 
-def ollama_chat(messages: list[dict]) -> dict:
+def deepseek_chat(messages: list[dict]) -> dict:
     request = urllib.request.Request(
-        f"{OLLAMA_URL}/api/chat",
+        f"{DEEPSEEK_URL}/chat/completions",
         data=json.dumps(
-            {"model": OLLAMA_MODEL, "messages": messages, "tools": CHAT_TOOLS, "stream": False}
+            {"model": DEEPSEEK_MODEL, "messages": messages, "tools": CHAT_TOOLS}
         ).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        },
     )
-    with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
-        return json.load(response)["message"]
+    with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT) as response:
+        return json.load(response)["choices"][0]["message"]
+
+# Everyone in the directory with their jobs, for the chat system prompt.
+# Loaded at startup, or on the first chat if the database was down then.
+# IDs are left out so the model has none to repeat.
+chat_profiles: str | None = None
+
+def load_chat_profiles() -> str:
+    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        rows = cur.execute(
+            """
+            SELECT p.id, p.name, p.role, p.services, p.location, p.bio,
+                   e.title, e.start_date, e.end_date,
+                   o.name AS organization, o.org_type
+            FROM people p
+            LEFT JOIN employment e ON e.person_id = p.id
+            LEFT JOIN organizations o ON o.id = e.organization_id
+            ORDER BY p.id, e.end_date IS NOT NULL, e.start_date DESC
+            """
+        ).fetchall()
+    people = {}
+    for row in rows:
+        person = people.setdefault(row["id"], {**row, "jobs": []})
+        if row["title"] is not None:
+            years = (
+                f"{row['start_date'].year}-{row['end_date'].year}"
+                if row["end_date"]
+                else f"since {row['start_date'].year}"
+            )
+            person["jobs"].append(
+                f"{row['title']} at {row['organization']} ({row['org_type']}), {years}"
+            )
+    lines = []
+    for p in people.values():
+        line = f"- {p['name']}, {p['role']}"
+        if p["location"]:
+            line += f", {p['location']}"
+        line += "."
+        if p["services"]:
+            line += f" Services: {', '.join(p['services'])}."
+        if p["bio"]:
+            line += f" {p['bio']}"
+        if p["jobs"]:
+            line += f" Jobs: {'; '.join(p['jobs'])}."
+        lines.append(line)
+    return "\n".join(lines)
+
+def get_chat_profiles() -> str:
+    global chat_profiles
+    if chat_profiles is None:
+        chat_profiles = load_chat_profiles()
+    return chat_profiles
 
 def normalize_quote(text: str) -> str:
     text = text.translate({0x2018: "'", 0x2019: "'", 0x201C: '"', 0x201D: '"'})
@@ -493,8 +563,15 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat")
 def chat(request: ChatRequest):
+    if not DEEPSEEK_API_KEY:
+        raise HTTPException(status_code=503, detail="Language model not configured")
+    try:
+        profiles = get_chat_profiles()
+    except DB_ERRORS:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    system_prompt = CHAT_SYSTEM_PROMPT.format(today=date.today(), profiles=profiles)
     messages = [
-        {"role": "system", "content": CHAT_SYSTEM_PROMPT.format(today=date.today())},
+        {"role": "system", "content": system_prompt},
         *(
             {"role": turn.role, "content": turn.content[:CHAT_HISTORY_CHARS]}
             for turn in request.history[-CHAT_HISTORY_MESSAGES:]
@@ -504,14 +581,18 @@ def chat(request: ChatRequest):
     tool_calls = []
     quote_sources = []
 
-    def call_tool(name: str, arguments: dict, automatic: bool = False):
+    def call_tool(call_id: str, name: str, arguments: dict | None, automatic: bool = False):
         result = run_chat_tool(name, arguments)
         tool_calls.append({"name": name, "arguments": arguments, "automatic": automatic})
         if name == "search_documents":
             for match in result.get("matches", []):
                 quote_sources.extend([match["text"], match["interview_title"]])
         messages.append(
-            {"role": "tool", "tool_name": name, "content": json.dumps(jsonable_encoder(result))}
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": json.dumps(jsonable_encoder(result)),
+            }
         )
 
     try:
@@ -529,28 +610,45 @@ def chat(request: ChatRequest):
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [
-                        {"function": {"name": "search_documents", "arguments": arguments}}
+                        {
+                            "id": "auto-search",
+                            "type": "function",
+                            "function": {
+                                "name": "search_documents",
+                                "arguments": json.dumps(arguments),
+                            },
+                        }
                     ],
                 }
             )
-            call_tool("search_documents", arguments, automatic=True)
+            call_tool("auto-search", "search_documents", arguments, automatic=True)
         for _ in range(CHAT_MAX_TOOL_ROUNDS + 1):
-            reply = ollama_chat(messages)
-            messages.append(reply)
+            reply = deepseek_chat(messages)
+            # content is null when the model calls tools.
+            content = reply.get("content") or ""
             if not reply.get("tool_calls"):
-                answer, removed = remove_unverified_quotes(
-                    reply.get("content", ""), quote_sources
-                )
+                answer, removed = remove_unverified_quotes(content, quote_sources)
                 return {
                     "answer": remove_ids(answer),
                     "tool_calls": tool_calls,
                     "removed_quotes": removed,
                 }
+            messages.append(
+                {"role": "assistant", "content": content, "tool_calls": reply["tool_calls"]}
+            )
+            # Arguments arrive as a JSON string; bad JSON goes back as an error.
             for call in reply["tool_calls"]:
-                call_tool(call["function"]["name"], call["function"].get("arguments") or {})
+                try:
+                    arguments = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    arguments = None
+                call_tool(call["id"], call["function"]["name"], arguments)
     except DB_ERRORS:
         raise HTTPException(status_code=503, detail="Database unavailable")
-    except OLLAMA_ERRORS:
+    except urllib.error.HTTPError as e:
+        # Bad key, rate limit or a DeepSeek outage.
+        raise HTTPException(status_code=502, detail=f"Language model error (HTTP {e.code})")
+    except CHAT_MODEL_ERRORS:
         raise HTTPException(status_code=503, detail="Language model unavailable")
     raise HTTPException(
         status_code=502,

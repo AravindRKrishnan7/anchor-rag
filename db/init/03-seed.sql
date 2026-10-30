@@ -30,7 +30,11 @@ INSERT INTO people (id, name, role, services, location, bio) VALUES
     (9, 'Suresh Kurup', 'Course Coordinator', ARRAY['STCW training', 'batch scheduling'],
         'Kochi', 'Runs admissions and batch planning for safety courses.'),
     (10, 'Neha Kulkarni', 'Admissions Officer', ARRAY['course admissions'],
-        'Mumbai', 'Handles enrolment for deck and engine upgrade courses.')
+        'Mumbai', 'Handles enrolment for deck and engine upgrade courses.'),
+    (11, 'Arjun Shetty', 'Chief Officer', ARRAY['cargo operations', 'ballast management'],
+        'Mangaluru', 'Runs cargo and ballast operations on crude and product tankers.'),
+    (12, 'Fatima Sheikh', 'Marine Superintendent', ARRAY['dry docking', 'fleet technical management'],
+        'Kochi', 'Oversees dry dockings and technical upkeep of an offshore supply fleet.')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO employment (id, person_id, organization_id, title, start_date, end_date) VALUES
@@ -47,7 +51,10 @@ INSERT INTO employment (id, person_id, organization_id, title, start_date, end_d
     (11, 7, 5, 'Electro-Technical Officer','2018-01-10', NULL),
     (12, 8, 3, 'In-house Legal Counsel',  '2013-05-01', '2021-10-31'),
     (13, 9, 6, 'Course Coordinator',      '2019-06-01', NULL),
-    (14, 10, 7, 'Admissions Officer',     '2021-02-01', NULL)
+    (14, 10, 7, 'Admissions Officer',     '2021-02-01', NULL),
+    (15, 11, 3, 'Second Officer',         '2012-08-01', '2017-12-31'),
+    (16, 11, 1, 'Chief Officer',          '2018-02-01', NULL),
+    (17, 12, 5, 'Marine Superintendent',  '2015-09-01', NULL)
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO courses (id, organization_id, code, name, duration_days, fee_inr, description) VALUES
