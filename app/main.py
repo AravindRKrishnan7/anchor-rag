@@ -1,20 +1,25 @@
+import hashlib
+import io
 import json
 import os
 import re
 import urllib.error
 import urllib.request
+import uuid
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
 import psycopg
-from fastapi import FastAPI, HTTPException
+import pypdf
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import PoolTimeout
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from app.db import pool
 from app.embeddings import EMBED_MODEL, embed_query, to_pgvector
@@ -38,11 +43,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 INDEX_HTML = Path(__file__).parent / "static" / "index.html"
+UPLOAD_HTML = Path(__file__).parent / "static" / "upload.html"
 
 # Demo chat page; read per request so edits show up on refresh.
 @app.get("/", include_in_schema=False)
 def index():
     return FileResponse(INDEX_HTML)
+
+# Course PDF upload page. No auth yet: local demo only.
+@app.get("/admin/upload", include_in_schema=False)
+def upload_page():
+    return FileResponse(UPLOAD_HTML)
 
 @app.get("/health")
 def health():
@@ -444,12 +455,20 @@ def run_chat_tool(name: str, arguments: dict | None) -> dict:
     result = fetch(key)
     return result if result is not None else {"error": not_found}
 
-def deepseek_chat(messages: list[dict]) -> dict:
+def deepseek_chat(
+    messages: list[dict], tools: list[dict] | None = CHAT_TOOLS,
+    response_format: dict | None = None, temperature: float | None = None,
+) -> dict:
+    body = {"model": DEEPSEEK_MODEL, "messages": messages}
+    if temperature is not None:
+        body["temperature"] = temperature
+    if tools:
+        body["tools"] = tools
+    if response_format:
+        body["response_format"] = response_format
     request = urllib.request.Request(
         f"{DEEPSEEK_URL}/chat/completions",
-        data=json.dumps(
-            {"model": DEEPSEEK_MODEL, "messages": messages, "tools": CHAT_TOOLS}
-        ).encode(),
+        data=json.dumps(body).encode(),
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -654,3 +673,351 @@ def chat(request: ChatRequest):
         status_code=502,
         detail=f"Model was still calling tools after {CHAT_MAX_TOOL_ROUNDS} rounds",
     )
+
+# Course updates from PDFs: the model extracts course fields into a draft,
+# an admin compares it with the current course and approves, and only then
+# is anything saved.
+PDF_MAX_BYTES = 5 * 1024 * 1024
+# Characters of PDF text sent to the model; course brochures are short.
+PDF_MAX_CHARS = 20000
+# Drafts live in memory until approved, so a restart discards them.
+DRAFT_TTL = timedelta(hours=1)
+# Course columns a draft can change. The institute is matched, never changed.
+DRAFT_FIELDS = ("name", "code", "duration_days", "fee_inr")
+
+EXTRACT_PROMPT = """Extract training course details from the document text the user \
+sends. Reply with only a JSON object with these keys:
+- "name": course name
+- "code": course code (e.g. "BST")
+- "institute": name of the institute offering the course
+- "duration_days": length of the course in days, as an integer
+- "fee_inr": course fee in Indian rupees, as an integer without symbols or commas
+- "batches": list of {"start_date", "end_date", "capacity", "location"}, dates as \
+YYYY-MM-DD, capacity as the integer number of seats
+Use null for anything the document does not state and [] when it lists no batches. \
+Never guess a value: a fee in another currency is null, a batch without both a start \
+and an end date is left out, and capacity is null unless a seat count is written."""
+
+def empty_to_none(value):
+    if isinstance(value, str):
+        value = value.strip()
+    return value if value != "" else None
+
+class ExtractedBatch(BaseModel):
+    start_date: date
+    end_date: date
+    capacity: int | None = Field(default=None, gt=0)
+    location: str | None = None
+
+    @field_validator("capacity", "location", mode="before")
+    @classmethod
+    def blank_is_none(cls, value):
+        return empty_to_none(value)
+
+    @model_validator(mode="after")
+    def check_dates(self):
+        if self.end_date < self.start_date:
+            raise ValueError("end_date is before start_date")
+        return self
+
+class ExtractedCourse(BaseModel):
+    name: str | None = None
+    code: str | None = None
+    institute: str | None = None
+    duration_days: int | None = Field(default=None, gt=0)
+    fee_inr: int | None = Field(default=None, ge=0)
+    batches: list[ExtractedBatch] = []
+
+    @field_validator("name", "code", "institute", "duration_days", "fee_inr", mode="before")
+    @classmethod
+    def blank_is_none(cls, value):
+        return empty_to_none(value)
+
+    @field_validator("batches", mode="before")
+    @classmethod
+    def null_batches(cls, value):
+        return [] if value is None else value
+
+def pdf_text(data: bytes) -> str:
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+    except pypdf.errors.PyPdfError:
+        raise HTTPException(status_code=422, detail="Could not read this PDF")
+
+def extract_course(text: str) -> ExtractedCourse:
+    reply = deepseek_chat(
+        [
+            {"role": "system", "content": EXTRACT_PROMPT},
+            {"role": "user", "content": text[:PDF_MAX_CHARS]},
+        ],
+        tools=None,
+        response_format={"type": "json_object"},
+        temperature=0,  # same PDF, same draft
+    )
+    try:
+        return ExtractedCourse.model_validate(json.loads(reply.get("content") or ""))
+    except (json.JSONDecodeError, ValidationError) as e:
+        raise HTTPException(status_code=502, detail=f"Model returned invalid course data: {e}")
+
+# The model is told not to invent values; like quotes in chat, that is
+# checked here. Text values must appear in the PDF, and numbers must appear
+# as a whole number (with "19,500" read as 19500).
+def ground_course(course: ExtractedCourse, text: str) -> tuple[ExtractedCourse, list[str]]:
+    plain = re.sub(r"\s+", " ", text).lower()
+    # Digit-group commas, including Indian grouping ("1,19,500").
+    numbers = re.sub(r"(?<=\d),(?=\d{2,3}\b)", "", plain)
+
+    def has_text(value: str) -> bool:
+        return re.sub(r"\s+", " ", value).lower() in plain
+
+    def has_number(value: int) -> bool:
+        return re.search(rf"(?<!\d){value}(?!\d)", numbers) is not None
+
+    warnings = []
+    for field in ("name", "code", "institute"):
+        value = getattr(course, field)
+        if value is not None and not has_text(value):
+            warnings.append(f"Ignored {field} {value!r}: not found in the PDF")
+            setattr(course, field, None)
+    for field in ("duration_days", "fee_inr"):
+        value = getattr(course, field)
+        if value is not None and not has_number(value):
+            warnings.append(f"Ignored {field} {value}: not found in the PDF")
+            setattr(course, field, None)
+    batches = []
+    for b in course.batches:
+        days = [b.start_date.day, b.start_date.year, b.end_date.day, b.end_date.year]
+        if not all(has_number(n) for n in days):
+            warnings.append(f"Ignored batch {b.start_date} to {b.end_date}: dates not found in the PDF")
+            continue
+        if b.capacity is not None and not has_number(b.capacity):
+            warnings.append(f"Ignored capacity {b.capacity} for batch {b.start_date}: not found in the PDF")
+            b.capacity = None
+        if b.location is not None and not has_text(b.location):
+            b.location = None
+        batches.append(b)
+    course.batches = batches
+    return course, warnings
+
+COURSE_SNAPSHOT = """
+    SELECT c.id, c.organization_id, c.name, c.code, c.duration_days, c.fee_inr,
+           o.name AS institute
+    FROM courses c
+    JOIN organizations o ON o.id = c.organization_id
+"""
+
+# Finds the course a PDF describes: by code at the named institute, then by
+# code alone if only one course has it, then by name the same way.
+def match_course(cur, course: ExtractedCourse) -> tuple[dict | None, dict | None]:
+    institute = None
+    if course.institute:
+        institute = cur.execute(
+            "SELECT id, name FROM organizations WHERE lower(name) = lower(%s)",
+            (course.institute,),
+        ).fetchone()
+    for column, value in (("code", course.code), ("name", course.name)):
+        if value is None:
+            continue
+        rows = cur.execute(
+            f"{COURSE_SNAPSHOT} WHERE lower(c.{column}) = lower(%s) ORDER BY c.id", (value,)
+        ).fetchall()
+        if institute is not None:
+            rows = [r for r in rows if r["organization_id"] == institute["id"]]
+        if len(rows) == 1:
+            return rows[0], institute
+    return None, institute
+
+def existing_batch_dates(cur, course_id: int) -> set[tuple[date, date]]:
+    rows = cur.execute(
+        "SELECT start_date, end_date FROM course_batches WHERE course_id = %s", (course_id,)
+    ).fetchall()
+    return {(r["start_date"], r["end_date"]) for r in rows}
+
+drafts: dict[str, dict] = {}
+
+def build_draft(course: ExtractedCourse, current: dict | None, institute: dict | None,
+                batch_dates: set) -> dict:
+    fields = []
+    for field in DRAFT_FIELDS:
+        old = current[field] if current else None
+        new = getattr(course, field)
+        # Empty values from the PDF leave the course as it is.
+        fields.append({"field": field, "current": old, "new": new,
+                       "changed": new is not None and new != old})
+    batches = []
+    for b in course.batches:
+        if (b.start_date, b.end_date) in batch_dates:
+            status = "exists"
+        elif b.capacity is None:
+            status = "no_capacity"
+        else:
+            status = "new"
+        batches.append({**b.model_dump(), "status": status})
+    blocked = None
+    if current is None and (course.name is None or institute is None):
+        blocked = (
+            "No matching course, and a new one needs a course name and an "
+            "institute already in the directory"
+        )
+    elif not any(f["changed"] for f in fields) and not any(
+        b["status"] == "new" for b in batches
+    ):
+        blocked = "Nothing to change: the course already matches this PDF"
+    return {
+        "new_course": current is None,
+        "course_id": current["id"] if current else None,
+        "institute": {
+            "current": current["institute"] if current else None,
+            "pdf": course.institute,
+            "matched": institute["name"] if institute else None,
+        },
+        "fields": fields,
+        "batches": batches,
+        "can_apply": blocked is None,
+        "blocked_reason": blocked,
+    }
+
+@app.post("/courses/upload-pdf")
+def upload_course_pdf(file: UploadFile = File(...)):
+    if not DEEPSEEK_API_KEY:
+        raise HTTPException(status_code=503, detail="Language model not configured")
+    data = file.file.read(PDF_MAX_BYTES + 1)
+    if len(data) > PDF_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="PDF is larger than 5 MB")
+    if not data.startswith(b"%PDF-"):
+        raise HTTPException(status_code=422, detail="File is not a PDF")
+    text = pdf_text(data)
+    if not text:
+        raise HTTPException(
+            status_code=422, detail="PDF has no text to read (it may be a scanned image)"
+        )
+    try:
+        course, warnings = ground_course(extract_course(text), text)
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            current, institute = match_course(cur, course)
+            batch_dates = existing_batch_dates(cur, current["id"]) if current else set()
+    except DB_ERRORS:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    except urllib.error.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Language model error (HTTP {e.code})")
+    except CHAT_MODEL_ERRORS:
+        raise HTTPException(status_code=503, detail="Language model unavailable")
+
+    if course.institute and institute is None:
+        warnings.append(f"Institute {course.institute!r} is not in the directory")
+    elif current and institute and institute["id"] != current["organization_id"]:
+        warnings.append("The PDF names a different institute; the course's institute is not changed")
+
+    now = datetime.now(timezone.utc)
+    for draft_id in [k for k, d in drafts.items() if now - d["extracted_at"] > DRAFT_TTL]:
+        drafts.pop(draft_id, None)
+    draft_id = uuid.uuid4().hex
+    draft = build_draft(course, current, institute, batch_dates)
+    drafts[draft_id] = {
+        "course": course,
+        "current": current,
+        "institute": institute,
+        "source_file": Path(file.filename or "upload.pdf").name,
+        "source_sha256": hashlib.sha256(data).hexdigest(),
+        "extracted_at": now,
+    }
+    return {
+        "draft_id": draft_id,
+        "source_file": drafts[draft_id]["source_file"],
+        "extracted_at": now,
+        **draft,
+        "warnings": warnings,
+    }
+
+class ApplyDraft(BaseModel):
+    draft_id: str
+
+@app.post("/courses/apply-draft")
+def apply_course_draft(request: ApplyDraft):
+    # Taken out first so the same draft can't be applied twice at once; put
+    # back if the database is down so the admin can retry.
+    draft = drafts.pop(request.draft_id, None)
+    if draft is None or datetime.now(timezone.utc) - draft["extracted_at"] > DRAFT_TTL:
+        raise HTTPException(status_code=404, detail="Draft not found or expired; upload the PDF again")
+    course, current, institute = draft["course"], draft["current"], draft["institute"]
+    try:
+        with pool.connection() as conn, conn.transaction(), \
+                conn.cursor(row_factory=dict_row) as cur:
+            if current is not None:
+                row = cur.execute(
+                    f"{COURSE_SNAPSHOT} WHERE c.id = %s FOR UPDATE OF c", (current["id"],)
+                ).fetchone()
+                if row != current:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The course changed after this PDF was read; upload it again",
+                    )
+                course_id = current["id"]
+                changes = {
+                    f: {"old": current[f], "new": getattr(course, f)}
+                    for f in DRAFT_FIELDS
+                    if getattr(course, f) is not None and getattr(course, f) != current[f]
+                }
+                if changes:
+                    assignments = ", ".join(f"{f} = %({f})s" for f in changes)
+                    cur.execute(
+                        f"UPDATE courses SET {assignments} WHERE id = %(id)s",
+                        {**{f: c["new"] for f, c in changes.items()}, "id": course_id},
+                    )
+            else:
+                if course.name is None or institute is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="A new course needs a name and an institute in the directory",
+                    )
+                course_id = cur.execute(
+                    """
+                    INSERT INTO courses (organization_id, code, name, duration_days, fee_inr)
+                    VALUES (%s, %s, %s, %s, %s) RETURNING id
+                    """,
+                    (institute["id"], course.code, course.name,
+                     course.duration_days, course.fee_inr),
+                ).fetchone()["id"]
+                changes = {
+                    f: {"old": None, "new": getattr(course, f)}
+                    for f in DRAFT_FIELDS if getattr(course, f) is not None
+                }
+            # Checked again inside the transaction in case a batch was added since.
+            batch_dates = existing_batch_dates(cur, course_id)
+            added = []
+            for b in course.batches:
+                if b.capacity is None or (b.start_date, b.end_date) in batch_dates:
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO course_batches (course_id, start_date, end_date, capacity, location)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (course_id, b.start_date, b.end_date, b.capacity, b.location),
+                )
+                added.append(b.model_dump())
+            if not changes and not added:
+                raise HTTPException(status_code=422, detail="Nothing to change")
+            cur.execute(
+                """
+                INSERT INTO course_updates
+                    (course_id, source_file, source_sha256, extracted_at, changes)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (course_id, draft["source_file"], draft["source_sha256"], draft["extracted_at"],
+                 Jsonb(jsonable_encoder({"fields": changes, "batches_added": added}))),
+            )
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(
+            status_code=409, detail="A course with this code already exists at the institute"
+        )
+    except DB_ERRORS:
+        drafts[request.draft_id] = draft
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    # Saved by now; a failed read-back must not restore the draft.
+    try:
+        saved = fetch_course(course_id)
+    except DB_ERRORS:
+        saved = None
+    return {"course": saved, "changes": changes, "batches_added": added}
