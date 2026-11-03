@@ -29,7 +29,7 @@ LINES = [
     (11, "Start date: 11 January 2027"),
     (11, "End date: 20 January 2027"),
     (11, "Location: Kochi"),
-    (11, "Seats: 30"),
+    (11, "Capacity: 30 seats"),
     (11, ""),
     (9, "Enquiries: admissions office, Kochi Maritime Academy."),
 ]

@@ -12,7 +12,7 @@ endobj
 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
 endobj
 5 0 obj
-<< /Length 912 >>
+<< /Length 921 >>
 stream
 BT
 72 770 Td
@@ -60,7 +60,7 @@ BT
 (Location: Kochi) Tj
 /F1 11 Tf
 0 -18 Td
-(Seats: 30) Tj
+(Capacity: 30 seats) Tj
 /F1 11 Tf
 0 -18 Td
 /F1 9 Tf
@@ -80,5 +80,5 @@ xref
 trailer
 << /Size 6 /Root 1 0 R >>
 startxref
-1301
+1310
 %%EOF

@@ -84,10 +84,31 @@
   tr.changed td { background: var(--change-bg); }
   tr.changed td.new { font-weight: 600; color: var(--teal-dark); }
   .empty { color: var(--muted); font-style: italic; }
-  .tag { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+  .aside { display: block; font-size: 13px; color: var(--muted); font-weight: 400; }
+  .tag { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; margin: 0 4px 4px 0; }
   .tag.new { background: var(--change-bg); color: var(--teal-dark); }
   .tag.exists { background: var(--line); color: var(--muted); }
-  .tag.no_capacity { background: var(--warn-bg); color: var(--warn-ink); }
+  .tag.needs_capacity { background: var(--warn-bg); color: var(--warn-ink); }
+  .tag.seats { background: var(--ok-bg); color: var(--ok-ink); }
+  input.capacity {
+    width: 90px;
+    font: inherit;
+    padding: 4px 8px;
+    border: 1px solid #c9d3dc;
+    border-radius: 8px;
+  }
+  input.capacity:focus { outline: 2px solid var(--teal); outline-offset: -1px; border-color: transparent; }
+  input.capacity:invalid:not(:placeholder-shown) { border-color: var(--error-ink); }
+
+  .choice { background: var(--warn-bg); border-radius: 10px; padding: 12px 14px; margin: 0 0 14px; }
+  .choice p { margin: 0 0 8px; color: var(--warn-ink); font-weight: 600; }
+  .choice label {
+    display: flex; gap: 10px; align-items: flex-start;
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; margin-top: 8px; cursor: pointer;
+  }
+  .choice label:has(input:checked) { border-color: var(--teal); box-shadow: 0 0 0 1px var(--teal); }
+  .choice input { margin-top: 4px; accent-color: var(--teal); }
 
   .note { border-radius: 10px; padding: 10px 14px; margin: 12px 0 0; font-size: 15px; }
   .note.warn { background: var(--warn-bg); color: var(--warn-ink); }
@@ -130,26 +151,32 @@
   <div class="card" id="draft" hidden>
     <h2 id="draft-title"></h2>
     <p class="meta" id="draft-meta"></p>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Field</th><th>Current</th><th>From PDF</th></tr></thead>
-        <tbody id="fields"></tbody>
-      </table>
-    </div>
-    <div id="batches-section">
-      <h3>Batches in the PDF</h3>
+    <fieldset class="choice" id="choice" hidden style="border:0">
+      <p>This PDF may describe a course already in the directory. Choose one:</p>
+      <div id="choices"></div>
+    </fieldset>
+    <div id="comparison" hidden>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Dates</th><th>Location</th><th>Seats</th><th></th></tr></thead>
-          <tbody id="batches"></tbody>
+          <thead><tr><th>Field</th><th>Current</th><th>From PDF</th></tr></thead>
+          <tbody id="fields"></tbody>
         </table>
+      </div>
+      <div id="batches-section">
+        <h3>Batches in the PDF</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Dates</th><th>Location</th><th>Capacity</th><th>Seats open</th><th></th></tr></thead>
+            <tbody id="batches"></tbody>
+          </table>
+        </div>
       </div>
     </div>
     <div class="note warn" id="warnings" hidden></div>
     <div class="note warn" id="blocked" hidden></div>
     <div class="actions">
-      <button type="button" id="approve">Approve</button>
-      <span id="approve-hint">Saves the highlighted changes</span>
+      <button type="button" id="approve" disabled>Approve</button>
+      <span id="approve-hint"></span>
     </div>
     <div class="note error" id="apply-error" hidden></div>
     <div class="note ok" id="applied" hidden></div>
@@ -158,9 +185,10 @@
 
 <script>
 const LABELS = {name: "Course name", code: "Code", duration_days: "Duration", fee_inr: "Fee"};
-const STATUS = {new: "Will be added", exists: "Already listed", no_capacity: "Skipped: no seat count in PDF"};
+const STATUS = {new: "Will be added", exists: "Already listed", needs_capacity: "Enter capacity to add"};
 const $ = id => document.getElementById(id);
-let draftId = null;
+let draft = null;
+let option = null;  // the chosen entry of draft.options
 
 function show(id, text) { $(id).textContent = text; $(id).hidden = !text; }
 
@@ -183,6 +211,13 @@ function cell(text, className) {
   return td;
 }
 
+function tag(kind, text) {
+  const span = document.createElement("span");
+  span.className = `tag ${kind}`;
+  span.textContent = text;
+  return span;
+}
+
 async function post(url, options) {
   let response;
   try {
@@ -198,42 +233,38 @@ async function post(url, options) {
 }
 
 function renderDraft(d) {
-  draftId = d.draft_id;
-  $("draft-title").textContent = d.new_course ? "New course" : (d.fields.find(f => f.field === "name").current);
-  const institute = d.institute.current || d.institute.matched || d.institute.pdf || "unknown institute";
-  $("draft-meta").textContent = `${institute} · from ${d.source_file}`;
+  draft = d;
+  option = null;
+  const pdfName = [d.pdf.name, d.pdf.code].filter(Boolean).join(" · ");
+  $("draft-title").textContent = pdfName || "Course from PDF";
+  $("draft-meta").textContent = `${d.institute || d.pdf.institute || "Unknown institute"} · from ${d.source_file}`;
 
-  const fields = $("fields");
-  fields.replaceChildren();
-  for (const f of d.fields) {
-    const tr = document.createElement("tr");
-    if (f.changed) tr.className = "changed";
-    tr.append(
-      cell(LABELS[f.field]),
-      d.new_course ? cell("—") : cell(format(f.field, f.current) ?? "—"),
-      cell(f.new === null ? null : format(f.field, f.new) + (f.changed || d.new_course ? "" : " (no change)"), "new"),
-    );
-    fields.appendChild(tr);
+  const choices = $("choices");
+  choices.replaceChildren();
+  if (d.requires_choice) {
+    for (const o of d.options) {
+      const match = d.likely_matches.find(m => m.target === o.target);
+      const label = document.createElement("label");
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "target";
+      radio.addEventListener("change", () => choose(o));
+      const text = document.createElement("span");
+      const title = document.createElement("strong");
+      title.textContent = match
+        ? `Update this existing course: ${match.name}${match.code ? ` (${match.code})` : ""}`
+        : "Create as new course";
+      const aside = document.createElement("span");
+      aside.className = "aside";
+      aside.textContent = match
+        ? `${match.reason}. Keeps its name and code; updates fee, duration, batches and seats.`
+        : `Adds ${pdfName || "it"} alongside the existing course.`;
+      text.append(title, aside);
+      label.append(radio, text);
+      choices.appendChild(label);
+    }
   }
-
-  const batches = $("batches");
-  batches.replaceChildren();
-  for (const b of d.batches) {
-    const tr = document.createElement("tr");
-    const tag = document.createElement("span");
-    tag.className = `tag ${b.status}`;
-    tag.textContent = STATUS[b.status];
-    const status = document.createElement("td");
-    status.appendChild(tag);
-    tr.append(
-      cell(`${formatDate(b.start_date)} – ${formatDate(b.end_date)}`),
-      cell(b.location ?? "—"),
-      cell(b.capacity === null ? "—" : String(b.capacity)),
-      status,
-    );
-    batches.appendChild(tr);
-  }
-  $("batches-section").hidden = d.batches.length === 0;
+  $("choice").hidden = !d.requires_choice;
 
   const warnings = $("warnings");
   warnings.replaceChildren();
@@ -244,13 +275,91 @@ function renderDraft(d) {
   }
   warnings.hidden = d.warnings.length === 0;
 
-  show("blocked", d.can_apply ? "" : d.blocked_reason);
-  $("approve").disabled = !d.can_apply;
-  $("approve").hidden = false;
-  $("approve-hint").hidden = !d.can_apply;
   show("apply-error", "");
   show("applied", "");
+  $("approve").hidden = false;
+  $("approve-hint").hidden = false;
   $("draft").hidden = false;
+  if (d.requires_choice) {
+    $("comparison").hidden = true;
+    show("blocked", "");
+    updateApprove();
+  } else {
+    choose(d.options[0]);
+  }
+}
+
+function choose(o) {
+  option = o;
+  const isNew = o.target === "new";
+  const fields = $("fields");
+  fields.replaceChildren();
+  for (const f of o.fields) {
+    const tr = document.createElement("tr");
+    if (f.changed) tr.className = "changed";
+    let shown = null;
+    if (f.new !== null) {
+      shown = format(f.field, f.new);
+      if (f.kept) shown += " (not applied: keeps current)";
+      else if (!f.changed && !isNew) shown += " (no change)";
+    }
+    tr.append(
+      cell(LABELS[f.field]),
+      isNew ? cell("—") : cell(format(f.field, f.current) ?? "—"),
+      cell(shown, "new"),
+    );
+    fields.appendChild(tr);
+  }
+
+  const batches = $("batches");
+  batches.replaceChildren();
+  for (const b of o.batches) {
+    const tr = document.createElement("tr");
+    const capacity = document.createElement("td");
+    if (b.status === "needs_capacity") {
+      const input = document.createElement("input");
+      input.type = "number";
+      input.className = "capacity";
+      input.min = Math.max(1, b.seats_available ?? 1);
+      input.step = 1;
+      input.required = true;
+      input.placeholder = "Seats";
+      input.dataset.index = b.index;
+      input.setAttribute("aria-label", `Capacity for batch starting ${formatDate(b.start_date)}`);
+      input.addEventListener("input", updateApprove);
+      capacity.appendChild(input);
+    } else {
+      capacity.textContent = String(b.existing_capacity ?? b.capacity);
+    }
+    const status = document.createElement("td");
+    status.appendChild(tag(b.status, STATUS[b.status]));
+    if (b.seat_report) status.appendChild(tag("seats", "Seat count recorded"));
+    tr.append(
+      cell(`${formatDate(b.start_date)} – ${formatDate(b.end_date)}`),
+      cell(b.location ?? "—"),
+      capacity,
+      cell(b.seats_available === null ? "—" : String(b.seats_available)),
+      status,
+    );
+    batches.appendChild(tr);
+  }
+  $("batches-section").hidden = o.batches.length === 0;
+  $("comparison").hidden = false;
+  show("blocked", o.can_apply ? "" : o.blocked_reason);
+  updateApprove();
+}
+
+function capacityInputs() { return [...document.querySelectorAll("input.capacity")]; }
+
+function updateApprove() {
+  let hint = "";
+  if (!option) hint = "Choose an option above";
+  else if (!option.can_apply) hint = "";
+  else if (capacityInputs().some(i => !i.value || !i.checkValidity())) {
+    hint = "Enter the capacity for each new batch (at least its open seats)";
+  } else hint = "Saves the highlighted changes";
+  $("approve").disabled = !option || !option.can_apply || hint !== "Saves the highlighted changes";
+  $("approve-hint").textContent = hint;
 }
 
 $("pick").addEventListener("submit", async event => {
@@ -279,15 +388,16 @@ $("approve").addEventListener("click", async () => {
   approve.disabled = true;
   approve.textContent = "Saving…";
   show("apply-error", "");
+  const capacities = Object.fromEntries(capacityInputs().map(i => [i.dataset.index, Number(i.value)]));
   try {
     const result = await post("/courses/apply-draft", {
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({draft_id: draftId}),
+      body: JSON.stringify({draft_id: draft.draft_id, target: option.target, capacities}),
     });
     const parts = Object.entries(result.changes).map(([f, c]) => `${LABELS[f]} ${format(f, c.new)}`);
-    if (result.batches_added.length) {
-      parts.push(`${result.batches_added.length} new batch${result.batches_added.length > 1 ? "es" : ""}`);
-    }
+    const count = (n, word) => `${n} ${word}${n > 1 ? "s" : ""}`;
+    if (result.batches_added.length) parts.push(count(result.batches_added.length, "new batch").replace("batchs", "batches"));
+    if (result.seat_reports.length) parts.push(count(result.seat_reports.length, "seat count"));
     $("applied").replaceChildren(`Saved: ${parts.join(", ")}. The chatbot uses it now. `);
     const link = document.createElement("a");
     link.href = "/";
@@ -296,9 +406,10 @@ $("approve").addEventListener("click", async () => {
     $("applied").hidden = false;
     approve.hidden = true;
     $("approve-hint").hidden = true;
+    document.querySelectorAll("#choice input, input.capacity").forEach(i => { i.disabled = true; });
   } catch (error) {
     show("apply-error", error.message);
-    approve.disabled = false;
+    updateApprove();
   } finally {
     approve.textContent = "Approve";
   }

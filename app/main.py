@@ -8,6 +8,7 @@ import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Literal
 
@@ -692,11 +693,17 @@ sends. Reply with only a JSON object with these keys:
 - "institute": name of the institute offering the course
 - "duration_days": length of the course in days, as an integer
 - "fee_inr": course fee in Indian rupees, as an integer without symbols or commas
-- "batches": list of {"start_date", "end_date", "capacity", "location"}, dates as \
-YYYY-MM-DD, capacity as the integer number of seats
+- "batches": list of {"start_date", "end_date", "capacity", "seats_available", \
+"location"}, dates as YYYY-MM-DD
+  - "capacity": total seats in the batch, only when labelled as capacity, intake, \
+total seats or batch size
+  - "seats_available": seats still open, when labelled as seats available, seats \
+left, vacancies or similar
+  A number under "Seats available" is seats_available, never capacity.
 Use null for anything the document does not state and [] when it lists no batches. \
 Never guess a value: a fee in another currency is null, a batch without both a start \
-and an end date is left out, and capacity is null unless a seat count is written."""
+and an end date is left out, and capacity and seats_available are null unless that \
+exact count is written."""
 
 def empty_to_none(value):
     if isinstance(value, str):
@@ -707,9 +714,10 @@ class ExtractedBatch(BaseModel):
     start_date: date
     end_date: date
     capacity: int | None = Field(default=None, gt=0)
+    seats_available: int | None = Field(default=None, ge=0)
     location: str | None = None
 
-    @field_validator("capacity", "location", mode="before")
+    @field_validator("capacity", "seats_available", "location", mode="before")
     @classmethod
     def blank_is_none(cls, value):
         return empty_to_none(value)
@@ -791,9 +799,20 @@ def ground_course(course: ExtractedCourse, text: str) -> tuple[ExtractedCourse, 
         if not all(has_number(n) for n in days):
             warnings.append(f"Ignored batch {b.start_date} to {b.end_date}: dates not found in the PDF")
             continue
-        if b.capacity is not None and not has_number(b.capacity):
-            warnings.append(f"Ignored capacity {b.capacity} for batch {b.start_date}: not found in the PDF")
-            b.capacity = None
+        for field in ("capacity", "seats_available"):
+            value = getattr(b, field)
+            if value is not None and not has_number(value):
+                warnings.append(
+                    f"Ignored {field} {value} for batch {b.start_date}: not found in the PDF"
+                )
+                setattr(b, field, None)
+        if b.capacity is not None and b.seats_available is not None \
+                and b.seats_available > b.capacity:
+            warnings.append(
+                f"Ignored seats_available {b.seats_available} for batch {b.start_date}: "
+                f"more than its capacity {b.capacity}"
+            )
+            b.seats_available = None
         if b.location is not None and not has_text(b.location):
             b.location = None
         batches.append(b)
@@ -807,9 +826,37 @@ COURSE_SNAPSHOT = """
     JOIN organizations o ON o.id = c.organization_id
 """
 
+# Names at least this similar (difflib ratio, 0-1) count as a likely match.
+LIKELY_NAME_RATIO = 0.75
+# Shortest code that counts in a prefix match ("AFF" for "AFF-01").
+LIKELY_CODE_MIN = 3
+
+def normalize_name(name: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", name.lower()).split())
+
+def compact_code(code: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", code.lower())
+
+# Why a course might be the one a PDF describes without matching exactly,
+# or None. "AFF-01" is close to "AFF"; "Advanced Fire Fighting (STCW)"
+# contains "Advanced Fire Fighting".
+def likely_match_reason(course: ExtractedCourse, row: dict) -> str | None:
+    if course.code and row["code"]:
+        a, b = compact_code(course.code), compact_code(row["code"])
+        shorter = min(a, b, key=len)
+        if len(shorter) >= LIKELY_CODE_MIN and (a.startswith(b) or b.startswith(a)):
+            return f"Code {row['code']} is similar to {course.code}"
+    if course.name:
+        a, b = normalize_name(course.name), normalize_name(row["name"])
+        if a in b or b in a or SequenceMatcher(None, a, b).ratio() >= LIKELY_NAME_RATIO:
+            return f"Name is similar to {course.name}"
+    return None
+
 # Finds the course a PDF describes: by code at the named institute, then by
-# code alone if only one course has it, then by name the same way.
-def match_course(cur, course: ExtractedCourse) -> tuple[dict | None, dict | None]:
+# code alone if only one course has it, then by name the same way. Without
+# an exact match, returns likely matches at the same institute instead, as
+# (course, reason) pairs.
+def match_course(cur, course: ExtractedCourse) -> tuple[dict | None, list[tuple], dict | None]:
     institute = None
     if course.institute:
         institute = cur.execute(
@@ -825,53 +872,70 @@ def match_course(cur, course: ExtractedCourse) -> tuple[dict | None, dict | None
         if institute is not None:
             rows = [r for r in rows if r["organization_id"] == institute["id"]]
         if len(rows) == 1:
-            return rows[0], institute
-    return None, institute
+            return rows[0], [], institute
+    likely = []
+    if institute is not None:
+        rows = cur.execute(
+            f"{COURSE_SNAPSHOT} WHERE c.organization_id = %s ORDER BY c.id", (institute["id"],)
+        ).fetchall()
+        for row in rows:
+            reason = likely_match_reason(course, row)
+            if reason:
+                likely.append((row, reason))
+    return None, likely, institute
 
-def existing_batch_dates(cur, course_id: int) -> set[tuple[date, date]]:
+# A course's batches by (start_date, end_date).
+def existing_batches(cur, course_id: int) -> dict[tuple[date, date], dict]:
     rows = cur.execute(
-        "SELECT start_date, end_date FROM course_batches WHERE course_id = %s", (course_id,)
+        "SELECT id, start_date, end_date, capacity FROM course_batches WHERE course_id = %s",
+        (course_id,),
     ).fetchall()
-    return {(r["start_date"], r["end_date"]) for r in rows}
+    return {(r["start_date"], r["end_date"]): r for r in rows}
 
 drafts: dict[str, dict] = {}
 
-def build_draft(course: ExtractedCourse, current: dict | None, institute: dict | None,
-                batch_dates: set) -> dict:
+# What approving a draft would do to one course (or to a new one when
+# current is None). keep_identity leaves the name and code alone, for a
+# likely match the PDF may name differently.
+def build_option(course: ExtractedCourse, current: dict | None, keep_identity: bool,
+                 institute: dict | None, batches_by_dates: dict) -> dict:
     fields = []
     for field in DRAFT_FIELDS:
         old = current[field] if current else None
         new = getattr(course, field)
         # Empty values from the PDF leave the course as it is.
+        differs = new is not None and new != old
+        kept = differs and keep_identity and field in ("name", "code")
         fields.append({"field": field, "current": old, "new": new,
-                       "changed": new is not None and new != old})
+                       "changed": differs and not kept, "kept": kept})
     batches = []
-    for b in course.batches:
-        if (b.start_date, b.end_date) in batch_dates:
+    for index, b in enumerate(course.batches):
+        existing = batches_by_dates.get((b.start_date, b.end_date))
+        capacity = existing["capacity"] if existing else b.capacity
+        if existing:
             status = "exists"
         elif b.capacity is None:
-            status = "no_capacity"
+            status = "needs_capacity"
         else:
             status = "new"
-        batches.append({**b.model_dump(), "status": status})
+        # A new batch's capacity may still be entered, so it is checked on apply.
+        seat_report = b.seats_available is not None and (
+            capacity is None or b.seats_available <= capacity
+        )
+        batches.append({**b.model_dump(), "index": index, "status": status,
+                        "existing_capacity": existing["capacity"] if existing else None,
+                        "seat_report": seat_report})
     blocked = None
     if current is None and (course.name is None or institute is None):
-        blocked = (
-            "No matching course, and a new one needs a course name and an "
-            "institute already in the directory"
-        )
+        blocked = "A new course needs a course name and an institute already in the directory"
     elif not any(f["changed"] for f in fields) and not any(
-        b["status"] == "new" for b in batches
+        b["status"] != "exists" or b["seat_report"] for b in batches
     ):
         blocked = "Nothing to change: the course already matches this PDF"
     return {
-        "new_course": current is None,
-        "course_id": current["id"] if current else None,
-        "institute": {
-            "current": current["institute"] if current else None,
-            "pdf": course.institute,
-            "matched": institute["name"] if institute else None,
-        },
+        "target": current["id"] if current else "new",
+        "course": {"name": current["name"], "code": current["code"],
+                   "institute": current["institute"]} if current else None,
         "fields": fields,
         "batches": batches,
         "can_apply": blocked is None,
@@ -895,8 +959,20 @@ def upload_course_pdf(file: UploadFile = File(...)):
     try:
         course, warnings = ground_course(extract_course(text), text)
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            current, institute = match_course(cur, course)
-            batch_dates = existing_batch_dates(cur, current["id"]) if current else set()
+            current, likely, institute = match_course(cur, course)
+            # (course, keep_identity) for each choice; an exact match is the
+            # only one, likely matches come with "create as new".
+            if current:
+                choices = [(current, False)]
+            else:
+                choices = [(row, True) for row, _ in likely] + [(None, False)]
+            options = [
+                (c, keep, build_option(
+                    course, c, keep, institute,
+                    existing_batches(cur, c["id"]) if c else {},
+                ))
+                for c, keep in choices
+            ]
     except DB_ERRORS:
         raise HTTPException(status_code=503, detail="Database unavailable")
     except urllib.error.HTTPError as e:
@@ -908,16 +984,24 @@ def upload_course_pdf(file: UploadFile = File(...)):
         warnings.append(f"Institute {course.institute!r} is not in the directory")
     elif current and institute and institute["id"] != current["organization_id"]:
         warnings.append("The PDF names a different institute; the course's institute is not changed")
+    if any(b.seats_available is not None for b in course.batches):
+        warnings.append(
+            "Seat counts from the PDF are recorded as of approval, so the chatbot shows them "
+            "as fresh; approve only if the PDF is current"
+        )
 
     now = datetime.now(timezone.utc)
     for draft_id in [k for k, d in drafts.items() if now - d["extracted_at"] > DRAFT_TTL]:
         drafts.pop(draft_id, None)
     draft_id = uuid.uuid4().hex
-    draft = build_draft(course, current, institute, batch_dates)
     drafts[draft_id] = {
         "course": course,
-        "current": current,
         "institute": institute,
+        "options": {
+            option["target"]: {"current": c, "keep_identity": keep, "batches": option["batches"]}
+            for c, keep, option in options
+        },
+        "requires_choice": bool(likely),
         "source_file": Path(file.filename or "upload.pdf").name,
         "source_sha256": hashlib.sha256(data).hexdigest(),
         "extracted_at": now,
@@ -926,21 +1010,65 @@ def upload_course_pdf(file: UploadFile = File(...)):
         "draft_id": draft_id,
         "source_file": drafts[draft_id]["source_file"],
         "extracted_at": now,
-        **draft,
+        "match": "exact" if current else "likely" if likely else "none",
+        "requires_choice": bool(likely),
+        "pdf": {f: getattr(course, f) for f in ("name", "code", "institute")},
+        "institute": institute["name"] if institute else None,
+        "likely_matches": [
+            {"target": row["id"], "name": row["name"], "code": row["code"], "reason": reason}
+            for row, reason in likely
+        ],
+        "options": [option for _, _, option in options],
         "warnings": warnings,
     }
 
 class ApplyDraft(BaseModel):
     draft_id: str
+    # A course ID or "new"; required when the draft has likely matches.
+    target: int | Literal["new"] | None = None
+    # Capacities the admin entered, by batch index, for batches the PDF
+    # gives no capacity for.
+    capacities: dict[int, int] = {}
 
 @app.post("/courses/apply-draft")
 def apply_course_draft(request: ApplyDraft):
-    # Taken out first so the same draft can't be applied twice at once; put
-    # back if the database is down so the admin can retry.
-    draft = drafts.pop(request.draft_id, None)
+    draft = drafts.get(request.draft_id)
     if draft is None or datetime.now(timezone.utc) - draft["extracted_at"] > DRAFT_TTL:
         raise HTTPException(status_code=404, detail="Draft not found or expired; upload the PDF again")
-    course, current, institute = draft["course"], draft["current"], draft["institute"]
+    target = request.target
+    if target is None:
+        if draft["requires_choice"]:
+            raise HTTPException(
+                status_code=422,
+                detail="This PDF may describe an existing course: choose to update it or "
+                "create a new course",
+            )
+        (target,) = draft["options"]
+    if target not in draft["options"]:
+        raise HTTPException(status_code=422, detail="That course is not one of this draft's choices")
+    option = draft["options"][target]
+    course, institute = draft["course"], draft["institute"]
+    current, keep_identity = option["current"], option["keep_identity"]
+    for b in option["batches"]:
+        if b["status"] != "needs_capacity":
+            continue
+        capacity = request.capacities.get(b["index"])
+        when = f"the batch starting {b['start_date']}"
+        if capacity is None:
+            raise HTTPException(status_code=422, detail=f"Enter the capacity for {when}")
+        if capacity <= 0:
+            raise HTTPException(status_code=422, detail=f"Capacity for {when} must be above 0")
+        if b["seats_available"] is not None and capacity < b["seats_available"]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Capacity for {when} can't be less than its {b['seats_available']} "
+                "seats available",
+            )
+
+    # Taken out now so the same draft can't be applied twice at once; put
+    # back if the database is down so the admin can retry.
+    if drafts.pop(request.draft_id, None) is None:
+        raise HTTPException(status_code=404, detail="Draft not found or expired; upload the PDF again")
     try:
         with pool.connection() as conn, conn.transaction(), \
                 conn.cursor(row_factory=dict_row) as cur:
@@ -954,9 +1082,11 @@ def apply_course_draft(request: ApplyDraft):
                         detail="The course changed after this PDF was read; upload it again",
                     )
                 course_id = current["id"]
+                fields = [f for f in DRAFT_FIELDS
+                          if not (keep_identity and f in ("name", "code"))]
                 changes = {
                     f: {"old": current[f], "new": getattr(course, f)}
-                    for f in DRAFT_FIELDS
+                    for f in fields
                     if getattr(course, f) is not None and getattr(course, f) != current[f]
                 }
                 if changes:
@@ -984,20 +1114,37 @@ def apply_course_draft(request: ApplyDraft):
                     for f in DRAFT_FIELDS if getattr(course, f) is not None
                 }
             # Checked again inside the transaction in case a batch was added since.
-            batch_dates = existing_batch_dates(cur, course_id)
-            added = []
-            for b in course.batches:
-                if b.capacity is None or (b.start_date, b.end_date) in batch_dates:
-                    continue
-                cur.execute(
-                    """
-                    INSERT INTO course_batches (course_id, start_date, end_date, capacity, location)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (course_id, b.start_date, b.end_date, b.capacity, b.location),
-                )
-                added.append(b.model_dump())
-            if not changes and not added:
+            batches_by_dates = existing_batches(cur, course_id)
+            added, seat_reports = [], []
+            for index, b in enumerate(course.batches):
+                existing = batches_by_dates.get((b.start_date, b.end_date))
+                if existing:
+                    batch_id, capacity = existing["id"], existing["capacity"]
+                else:
+                    capacity = b.capacity or request.capacities.get(index)
+                    if capacity is None:
+                        continue  # existed when the draft was made, deleted since
+                    batch_id = cur.execute(
+                        """
+                        INSERT INTO course_batches
+                            (course_id, start_date, end_date, capacity, location)
+                        VALUES (%s, %s, %s, %s, %s) RETURNING id
+                        """,
+                        (course_id, b.start_date, b.end_date, capacity, b.location),
+                    ).fetchone()["id"]
+                    added.append({**b.model_dump(), "capacity": capacity,
+                                  "capacity_entered": b.capacity is None})
+                if b.seats_available is not None and b.seats_available <= capacity:
+                    cur.execute(
+                        """
+                        INSERT INTO seat_availability (batch_id, seats_available, source)
+                        VALUES (%s, %s, 'pdf')
+                        """,
+                        (batch_id, b.seats_available),
+                    )
+                    seat_reports.append({"start_date": b.start_date, "end_date": b.end_date,
+                                         "seats_available": b.seats_available})
+            if not changes and not added and not seat_reports:
                 raise HTTPException(status_code=422, detail="Nothing to change")
             cur.execute(
                 """
@@ -1006,7 +1153,10 @@ def apply_course_draft(request: ApplyDraft):
                 VALUES (%s, %s, %s, %s, %s)
                 """,
                 (course_id, draft["source_file"], draft["source_sha256"], draft["extracted_at"],
-                 Jsonb(jsonable_encoder({"fields": changes, "batches_added": added}))),
+                 Jsonb(jsonable_encoder({
+                     "target": "new" if current is None else "existing",
+                     "fields": changes, "batches_added": added, "seat_reports": seat_reports,
+                 }))),
             )
     except psycopg.errors.UniqueViolation:
         raise HTTPException(
@@ -1020,4 +1170,5 @@ def apply_course_draft(request: ApplyDraft):
         saved = fetch_course(course_id)
     except DB_ERRORS:
         saved = None
-    return {"course": saved, "changes": changes, "batches_added": added}
+    return {"course": saved, "changes": changes, "batches_added": added,
+            "seat_reports": seat_reports}
