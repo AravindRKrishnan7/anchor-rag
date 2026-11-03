@@ -119,6 +119,10 @@
     font-style: italic;
   }
   .msg.bot code { background: var(--sand); padding: 1px 5px; border-radius: 4px; font-size: 0.92em; }
+  .msg.bot .table-wrap { overflow-x: auto; margin: 0 0 10px; }
+  .msg.bot table { border-collapse: collapse; font-size: 14px; }
+  .msg.bot th, .msg.bot td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .msg.bot th { color: var(--navy); font-weight: 600; border-bottom-width: 2px; white-space: nowrap; }
 
   .thinking { display: flex; align-items: center; gap: 10px; color: var(--muted); }
   .dots { display: inline-flex; gap: 4px; }
@@ -237,8 +241,21 @@ function inline(text) {
     .replace(/(^|[^*])\*([^*\s][^*]*?)\*/g, "$1<em>$2</em>");
 }
 
-// Just enough Markdown for model answers: paragraphs, headings, lists and
-// quotes. Everything is escaped first, so the model can't inject HTML.
+// Cells of a "| a | b |" row; "\|" is a literal pipe inside a cell.
+function tableCells(line) {
+  let row = line.trim();
+  if (row.startsWith("|")) row = row.slice(1);
+  if (row.endsWith("|") && !row.endsWith("\\|")) row = row.slice(0, -1);
+  return row.split(/(?<!\\)\|/).map(cell => cell.replace(/\\\|/g, "|").trim());
+}
+
+function isTableSeparator(line) {
+  return line !== undefined && line.trim().startsWith("|") &&
+    tableCells(line).every(cell => /^:?-+:?$/.test(cell));
+}
+
+// Just enough Markdown for model answers: paragraphs, headings, lists,
+// quotes and tables. Everything is escaped first, so the model can't inject HTML.
 function renderMarkdown(source) {
   const lines = escapeHtml(source.trim()).split("\n");
   const html = [];
@@ -254,10 +271,25 @@ function renderMarkdown(source) {
     if (!block || block.tag !== tag) { flush(); block = {tag, items: []}; }
     block.items.push(text);
   };
-  for (const raw of lines) {
-    const line = raw.trim();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
     let m;
-    if (!line || /^(-{3,}|\*{3,})$/.test(line)) flush();
+    // A table is a header row, a |---|:---:| separator, then body rows.
+    if (line.startsWith("|") && isTableSeparator(lines[i + 1])) {
+      flush();
+      const align = tableCells(lines[i + 1]).map(c =>
+        c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : "");
+      const row = (cells, tag) => "<tr>" + align.map((a, j) =>
+        `<${tag}${a ? ` style="text-align:${a}"` : ""}>${inline(cells[j] ?? "")}</${tag}>`).join("") + "</tr>";
+      const head = row(tableCells(line), "th");
+      const body = [];
+      for (i += 2; i < lines.length && lines[i].trim().startsWith("|"); i++) {
+        body.push(row(tableCells(lines[i]), "td"));
+      }
+      i--;
+      html.push(`<div class="table-wrap"><table><thead>${head}</thead><tbody>${body.join("")}</tbody></table></div>`);
+    }
+    else if (!line || /^(-{3,}|\*{3,})$/.test(line)) flush();
     else if ((m = line.match(/^#{1,6}\s+(.*)/))) { flush(); html.push(`<p><strong>${inline(m[1])}</strong></p>`); }
     else if ((m = line.match(/^&gt;\s?(.*)/))) add("blockquote", m[1]);
     else if ((m = line.match(/^[-*+]\s+(.*)/))) add("ul", m[1]);
