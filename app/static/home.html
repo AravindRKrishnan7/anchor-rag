@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anchor</title>
+<style>
+  :root {
+    --navy: #0b2540;
+    --navy-2: #12345a;
+    --teal: #1f7a8c;
+    --teal-dark: #17606e;
+    --sand: #f4efe6;
+    --ink: #1b2733;
+    --muted: #5f6f7f;
+    --line: #dfe5ea;
+    --card: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  html, body { min-height: 100%; margin: 0; }
+  body {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    background: var(--sand);
+    color: var(--ink);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+
+  header {
+    background: linear-gradient(135deg, var(--navy), var(--navy-2));
+    color: #fff;
+    border-bottom: 3px solid var(--teal);
+  }
+  .bar {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 14px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .bar svg { width: 30px; height: 30px; flex: none; }
+  .bar span { font-size: 22px; font-weight: 600; letter-spacing: 0.04em; }
+
+  main {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 16px;
+  }
+  .welcome { max-width: 520px; width: 100%; text-align: center; }
+  .mark {
+    width: 72px; height: 72px; margin: 0 auto 18px;
+    display: grid; place-items: center;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--navy), var(--navy-2));
+    color: #fff;
+    box-shadow: 0 0 0 4px var(--sand), 0 0 0 6px var(--teal);
+  }
+  .mark svg { width: 38px; height: 38px; }
+  h1 { color: var(--navy); font-size: 34px; font-weight: 700; letter-spacing: 0.04em; margin: 0 0 8px; }
+  .tagline { color: var(--muted); font-size: 18px; margin: 0 0 30px; }
+  .actions { display: flex; gap: 12px; justify-content: center; }
+  .button {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 170px; height: 48px; padding: 0 24px;
+    border-radius: 12px;
+    font-weight: 600; text-decoration: none;
+  }
+  .button.primary { background: var(--teal); color: #fff; }
+  .button.primary:hover { background: var(--teal-dark); }
+  .button.secondary { background: var(--card); color: var(--navy); border: 1px solid var(--line); }
+  .button.secondary:hover { border-color: var(--teal); color: var(--teal-dark); }
+  .button:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 18px 0 0; }
+
+  @media (max-width: 520px) {
+    h1 { font-size: 28px; }
+    .tagline { font-size: 16px; }
+    .actions { flex-direction: column; }
+    .button { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="5" r="2.2"/>
+      <path d="M12 7.2V21"/>
+      <path d="M8 11h8"/>
+      <path d="M4.5 13.5a7.5 7.5 0 0 0 15 0"/>
+      <path d="M3 14.5l1.5-1 1.5 1M18 14.5l1.5-1 1.5 1"/>
+    </svg>
+    <span>Anchor</span>
+  </div>
+</header>
+
+<main>
+  <div class="welcome">
+    <div class="mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="5" r="2.2"/>
+        <path d="M12 7.2V21"/>
+        <path d="M8 11h8"/>
+        <path d="M4.5 13.5a7.5 7.5 0 0 0 15 0"/>
+        <path d="M3 14.5l1.5-1 1.5 1M18 14.5l1.5-1 1.5 1"/>
+      </svg>
+    </div>
+    <h1>Welcome to Anchor</h1>
+    <p class="tagline">Ask about maritime professionals, training courses and seat availability</p>
+    <div class="actions">
+      <a class="button primary" href="/ask">Start chatting</a>
+      <!-- The login page sends admins who are already logged in to the dashboard. -->
+      <a class="button secondary" href="/admin/login">Admin</a>
+    </div>
+    <p class="hint">No login needed to chat.</p>
+  </div>
+</main>
+</body>
+</html>

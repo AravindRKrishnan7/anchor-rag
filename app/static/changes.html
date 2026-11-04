@@ -49,6 +49,11 @@
     border-radius: 8px; padding: 5px 12px;
   }
   .nav button:hover { border-color: #fff; }
+  .nav a:hover { color: #fff; }
+  @media (max-width: 520px) {
+    .bar { flex-wrap: wrap; }
+    .nav { margin-left: 0; width: 100%; flex-wrap: wrap; }
+  }
 
   main { max-width: 1000px; margin: 0 auto; padding: 24px 16px 40px; }
   h2 { color: var(--navy); font-size: 20px; font-weight: 600; margin: 0 0 4px; }
@@ -87,8 +92,8 @@
     </svg>
     <h1>Anchor</h1>
     <nav class="nav">
-      <a href="/admin/upload">Upload PDF</a>
-      <a href="/">Chat</a>
+      <a href="/admin">Dashboard</a>
+      <a href="/ask">Chat</a>
       <form method="post" action="/admin/logout"><button type="submit">Log out</button></form>
     </nav>
   </div>

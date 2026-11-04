@@ -55,12 +55,20 @@ def redirect_to_login(request: Request, exc: LoginRequired):
     return RedirectResponse(f"/admin/login?next={quote(exc.next_path, safe='')}", status_code=303)
 
 STATIC = Path(__file__).parent / "static"
-INDEX_HTML = STATIC / "index.html"
 
-# Demo chat page; read per request so edits show up on refresh.
+# Pages are read per request so edits show up on refresh.
 @app.get("/", include_in_schema=False)
-def index():
-    return FileResponse(INDEX_HTML)
+def home():
+    return FileResponse(STATIC / "home.html")
+
+# Public chat page; it calls POST /chat.
+@app.get("/ask", include_in_schema=False)
+def ask_page():
+    return FileResponse(STATIC / "ask.html")
+
+@admin_router.get("")
+def dashboard():
+    return FileResponse(STATIC / "admin.html")
 
 @admin_router.get("/upload")
 def upload_page():

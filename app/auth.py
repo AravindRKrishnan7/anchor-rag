@@ -38,7 +38,7 @@ SCRYPT_MAXMEM = 64 * 1024 * 1024
 LOGIN_MAX_FAILURES_EMAIL = 5
 LOGIN_MAX_FAILURES_IP = 20
 LOGIN_WINDOW = 15 * 60
-DEFAULT_NEXT = "/admin/upload"
+DEFAULT_NEXT = "/admin"
 
 LOGIN_HTML = Path(__file__).parent / "static" / "login.html"
 

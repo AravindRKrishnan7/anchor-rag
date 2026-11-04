@@ -57,9 +57,11 @@
   }
   .reset:hover { border-color: #fff; }
   .reset:disabled { opacity: 0.45; cursor: not-allowed; }
+  .home { font-size: 13px; color: #b9cde0; white-space: nowrap; }
+  .home:hover { color: #fff; }
   @media (max-width: 520px) {
     .bar p { display: none; }
-    .reset { margin-left: auto; }
+    .home { margin-left: auto; }
   }
 
   main {
@@ -189,6 +191,7 @@
     </svg>
     <h1>Anchor</h1>
     <p>Maritime professionals &amp; training</p>
+    <a class="home" href="/">Home</a>
     <button class="reset" id="reset" type="button">New conversation</button>
   </div>
 </header>
