@@ -11,21 +11,21 @@ from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
 import psycopg
 import pypdf
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
-from psycopg_pool import PoolTimeout
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-from app.db import pool
+from app.auth import LoginRequired, require_admin, require_admin_page
+from app.auth import router as auth_router
+from app.db import DB_ERRORS, pool
 from app.embeddings import EMBED_MODEL, embed_query, to_pgvector
-
-DB_ERRORS = (psycopg.Error, PoolTimeout)
 
 # Seat counts older than these are flagged so clients can warn users.
 SEATS_FRESH_FOR = timedelta(days=1)
@@ -42,19 +42,33 @@ async def lifespan(app: FastAPI):
     pool.close()
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(auth_router)
 
-INDEX_HTML = Path(__file__).parent / "static" / "index.html"
-UPLOAD_HTML = Path(__file__).parent / "static" / "upload.html"
+# Everything under /admin needs a logged-in admin, so routes added to this
+# router later are protected too. It is included at the end of this file.
+admin_router = APIRouter(
+    prefix="/admin", dependencies=[Depends(require_admin_page)], include_in_schema=False
+)
+
+@app.exception_handler(LoginRequired)
+def redirect_to_login(request: Request, exc: LoginRequired):
+    return RedirectResponse(f"/admin/login?next={quote(exc.next_path, safe='')}", status_code=303)
+
+STATIC = Path(__file__).parent / "static"
+INDEX_HTML = STATIC / "index.html"
 
 # Demo chat page; read per request so edits show up on refresh.
 @app.get("/", include_in_schema=False)
 def index():
     return FileResponse(INDEX_HTML)
 
-# Course PDF upload page. No auth yet: local demo only.
-@app.get("/admin/upload", include_in_schema=False)
+@admin_router.get("/upload")
 def upload_page():
-    return FileResponse(UPLOAD_HTML)
+    return FileResponse(STATIC / "upload.html")
+
+@admin_router.get("/changes")
+def changes_page():
+    return FileResponse(STATIC / "changes.html")
 
 @app.get("/health")
 def health():
@@ -79,9 +93,12 @@ def fetch_person(person_id: int) -> dict | None:
             (person_id,),
         ).fetchone()
         if person is not None:
+            # status spells out what a NULL end_date means; models misread it.
             person["employment"] = cur.execute(
                 """
-                SELECT e.title, e.start_date, e.end_date,
+                SELECT e.title,
+                       CASE WHEN e.end_date IS NULL THEN 'current' ELSE 'former' END AS status,
+                       e.start_date, e.end_date,
                        o.id AS organization_id, o.name AS organization, o.org_type
                 FROM employment e
                 JOIN organizations o ON o.id = e.organization_id
@@ -111,6 +128,9 @@ def seat_freshness(age: timedelta | None) -> str:
         return "aging"
     return "stale"
 
+# Seats show only the count, when it was reported and how fresh it is. Who
+# reported it stays in seat_availability for admins and never reaches the
+# chat model or the public API.
 def fetch_course(course_id: int) -> dict | None:
     with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
         course = cur.execute(
@@ -127,18 +147,16 @@ def fetch_course(course_id: int) -> dict | None:
             batches = cur.execute(
                 """
                 SELECT b.id, b.start_date, b.end_date, b.capacity, b.location,
-                       s.seats_available, s.source, s.reported_at,
-                       now() - s.reported_at AS age,
-                       p.id AS reported_by_id, p.name AS reported_by_name
+                       s.seats_available, s.reported_at,
+                       now() - s.reported_at AS age
                 FROM course_batches b
                 LEFT JOIN LATERAL (
-                    SELECT seats_available, source, reported_at, reported_by_person_id
+                    SELECT seats_available, reported_at
                     FROM seat_availability
                     WHERE batch_id = b.id
                     ORDER BY reported_at DESC
                     LIMIT 1
                 ) s ON true
-                LEFT JOIN people p ON p.id = s.reported_by_person_id
                 WHERE b.course_id = %s
                 ORDER BY b.start_date
                 """,
@@ -156,12 +174,6 @@ def fetch_course(course_id: int) -> dict | None:
             "seats": {
                 "available": b["seats_available"],
                 "updated_at": b["reported_at"],
-                "source": b["source"],
-                "reported_by": (
-                    {"id": b["reported_by_id"], "name": b["reported_by_name"]}
-                    if b["reported_by_id"] is not None
-                    else None
-                ),
                 "age_hours": (
                     round(b["age"].total_seconds() / 3600, 1) if b["age"] is not None else None
                 ),
@@ -188,7 +200,8 @@ class SeatReport(BaseModel):
     reported_by_person_id: int | None = None
 
 @app.post("/batches/{batch_id}/seat-reports", status_code=201)
-def create_seat_report(batch_id: int, report: SeatReport):
+def create_seat_report(batch_id: int, report: SeatReport,
+                       admin: dict = Depends(require_admin)):
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             # FOR SHARE stops capacity changing between the check and the insert.
@@ -211,13 +224,14 @@ def create_seat_report(batch_id: int, report: SeatReport):
             return cur.execute(
                 """
                 INSERT INTO seat_availability
-                    (batch_id, seats_available, source, reported_by_person_id)
-                VALUES (%s, %s, %s, %s)
+                    (batch_id, seats_available, source, reported_by_person_id,
+                     recorded_by_admin_id)
+                VALUES (%s, %s, %s, %s, %s)
                 RETURNING id, batch_id, seats_available, source, reported_at,
-                          reported_by_person_id
+                          reported_by_person_id, recorded_by_admin_id
                 """,
                 (batch_id, report.seats_available, report.source,
-                 report.reported_by_person_id),
+                 report.reported_by_person_id, admin["id"]),
             ).fetchone()
     except DB_ERRORS:
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -247,7 +261,8 @@ professionals and training courses. Answer only from the profiles below and from
 tool results; never invent people, courses, dates or seat numbers. If neither has \
 the answer, say exactly: I don't have that information.
 
-The profiles list everyone in the directory with their jobs. For courses, seats \
+The profiles list everyone in the directory with their jobs, each marked \
+"current" (they still hold it) or "former" (it has ended). For courses, seats \
 and what people said in interviews, use the tools. When the user gives no ID, \
 search first with a few short keywords (a name, role, service, course name or \
 code), then look up details by the ID you found. The directory records which institute offers each course, \
@@ -255,6 +270,8 @@ not who teaches it. Seat counts include how fresh they are: say so when one is \
 "aging" or "stale", and say seats are unknown when there is no report. \
 For what people have said about their work, experience or advice, use \
 search_documents and attribute each point to the person who said it. \
+Give the answer itself, not where it came from: don't mention the profiles, \
+searches, tools or databases, and don't comment on whether a search was useful. \
 Today is {today}.
 
 Profiles:
@@ -337,8 +354,8 @@ CHAT_TOOLS = [
         "function": {
             "name": "get_course_batches",
             "description": "Look up a training course by ID: institute, fee, duration "
-            "and its batches with dates, capacity, latest seat availability and how "
-            "fresh that seat count is.",
+            "and its batches with dates, capacity, latest seat count, when it was "
+            "reported and how fresh it is.",
             "parameters": {
                 "type": "object",
                 "properties": {"course_id": {"type": "integer", "description": "Course ID"}},
@@ -500,13 +517,14 @@ def load_chat_profiles() -> str:
     for row in rows:
         person = people.setdefault(row["id"], {**row, "jobs": []})
         if row["title"] is not None:
-            years = (
-                f"{row['start_date'].year}-{row['end_date'].year}"
+            # "current"/"former" spelled out: models read "since 2022" as ended.
+            when = (
+                f"former, {row['start_date'].year}-{row['end_date'].year}"
                 if row["end_date"]
-                else f"since {row['start_date'].year}"
+                else f"current, since {row['start_date'].year}"
             )
             person["jobs"].append(
-                f"{row['title']} at {row['organization']} ({row['org_type']}), {years}"
+                f"{row['title']} at {row['organization']} ({row['org_type']}) ({when})"
             )
     lines = []
     for p in people.values():
@@ -571,6 +589,81 @@ def remove_unverified_quotes(answer: str, sources: list[str]) -> tuple[str, list
 
 def remove_ids(answer: str) -> str:
     return ID_MENTION.sub("", ID_IN_PARENS.sub("", answer))
+
+# Sentences about how the answer was found ("That search wasn't useful"),
+# which the prompt forbids but the model still writes, mostly after the
+# automatic follow-up search. Narrow on purpose: "search and rescue" and a
+# surveyor's "a search of the hull" are real topics.
+META_SENTENCE = re.compile(
+    r"\b(?:the|that|this|these|those|my|another|automatic|earlier|previous|initial"
+    r"|transcript|interview|document|course|people)\s+search(?:es)?\b(?!\s+and\s+rescue)"
+    r"|\bsearch(?:es)?\s+(?:results?|returned|found|turned\s+up|came\s+back|did\s+not"
+    r"|didn't|wasn't|was\s+not|shows?|showed)\b"
+    r"|\bI\s+(?:searched|looked\s+up|queried|ran\s+a\s+search|called|checked\s+the\s+(?:database|tools?|records))\b"
+    r"|\b(?:tool|function)\s+(?:calls?|results?)\b|\bsearch\s+tool\b"
+    r"|\b(?:in|from|according\s+to)\s+the\s+database\b"
+    r"|\bthe\s+profiles?\s+(?:provided|below|above|given|I\s+have|you\s+(?:gave|shared))\b"
+    r"|\b(?:from|in|according\s+to|based\s+on)\s+the\s+profiles?\b"
+    r"|\bI\s+only\s+have\s+(?:the|these)\b"
+    r"|\bI\s+can\s+(?:answer|tell\s+you|help\s+with)\s+(?:that|this)\s+from\b"
+    r"|\b(?:search_(?:people|courses|documents)|get_person|get_course_batches)\b",
+    re.I,
+)
+# "According to the database, the fee is ..." keeps the fact after the comma.
+META_LEAD_IN = re.compile(
+    r"^(?:according\s+to|based\s+on|from|per)\s+(?:the|my)\s+(?:database|records"
+    r"|profiles?|directory|search(?:es)?(?:\s+results?)?|tool\s+results?|transcript\s+search)"
+    r"\b[^,]*,\s*",
+    re.I,
+)
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=\S)")
+LIST_PREFIX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+)")
+NO_ANSWER = "I don't have that information."
+
+# A sentence without its talk of searching: unchanged if there is none, the
+# fact after a lead-in, ", but" or ":", or "" when nothing is left.
+def meta_free_part(sentence: str) -> str:
+    if not META_SENTENCE.search(sentence) and not META_LEAD_IN.match(sentence):
+        return sentence
+    rest = META_LEAD_IN.sub("", sentence, count=1)
+    if META_SENTENCE.search(rest):
+        for joint in (", but ", ": "):
+            _, found, after = rest.partition(joint)
+            if found and not META_SENTENCE.search(after):
+                rest = after
+                break
+        else:
+            rest = ""
+    return rest[:1].upper() + rest[1:]
+
+# Drops those sentences. Table rows and block quotes (checked transcript
+# text) are left alone. Returns the answer and the removed sentences.
+def remove_meta_sentences(answer: str) -> tuple[str, list[str]]:
+    removed = []
+    lines = []
+    for line in answer.split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped[0] in "|>":
+            lines.append(line)
+            continue
+        prefix_match = LIST_PREFIX.match(line)
+        prefix = prefix_match[1] if prefix_match else ""
+        kept = []
+        changed = False
+        for sentence in SENTENCE_END.split(line[len(prefix):]):
+            rest = meta_free_part(sentence)
+            if rest != sentence:
+                removed.append(sentence)
+                changed = True
+            if rest:
+                kept.append(rest)
+        if not changed:
+            lines.append(line)
+        elif kept:
+            lines.append(prefix + " ".join(kept))
+    # Collapse blank runs left where paragraphs were removed.
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return (cleaned or NO_ANSWER), removed
 
 # Only user and assistant turns, so a client can't inject system or tool messages.
 class ChatTurn(BaseModel):
@@ -648,10 +741,12 @@ def chat(request: ChatRequest):
             content = reply.get("content") or ""
             if not reply.get("tool_calls"):
                 answer, removed = remove_unverified_quotes(content, quote_sources)
+                answer, removed_meta = remove_meta_sentences(remove_ids(answer))
                 return {
-                    "answer": remove_ids(answer),
+                    "answer": answer,
                     "tool_calls": tool_calls,
                     "removed_quotes": removed,
+                    "removed_meta": removed_meta,
                 }
             messages.append(
                 {"role": "assistant", "content": content, "tool_calls": reply["tool_calls"]}
@@ -943,7 +1038,7 @@ def build_option(course: ExtractedCourse, current: dict | None, keep_identity: b
     }
 
 @app.post("/courses/upload-pdf")
-def upload_course_pdf(file: UploadFile = File(...)):
+def upload_course_pdf(file: UploadFile = File(...), admin: dict = Depends(require_admin)):
     if not DEEPSEEK_API_KEY:
         raise HTTPException(status_code=503, detail="Language model not configured")
     data = file.file.read(PDF_MAX_BYTES + 1)
@@ -1031,7 +1126,7 @@ class ApplyDraft(BaseModel):
     capacities: dict[int, int] = {}
 
 @app.post("/courses/apply-draft")
-def apply_course_draft(request: ApplyDraft):
+def apply_course_draft(request: ApplyDraft, admin: dict = Depends(require_admin)):
     draft = drafts.get(request.draft_id)
     if draft is None or datetime.now(timezone.utc) - draft["extracted_at"] > DRAFT_TTL:
         raise HTTPException(status_code=404, detail="Draft not found or expired; upload the PDF again")
@@ -1137,10 +1232,11 @@ def apply_course_draft(request: ApplyDraft):
                 if b.seats_available is not None and b.seats_available <= capacity:
                     cur.execute(
                         """
-                        INSERT INTO seat_availability (batch_id, seats_available, source)
-                        VALUES (%s, %s, 'pdf')
+                        INSERT INTO seat_availability
+                            (batch_id, seats_available, source, recorded_by_admin_id)
+                        VALUES (%s, %s, 'pdf', %s)
                         """,
-                        (batch_id, b.seats_available),
+                        (batch_id, b.seats_available, admin["id"]),
                     )
                     seat_reports.append({"start_date": b.start_date, "end_date": b.end_date,
                                          "seats_available": b.seats_available})
@@ -1149,14 +1245,14 @@ def apply_course_draft(request: ApplyDraft):
             cur.execute(
                 """
                 INSERT INTO course_updates
-                    (course_id, source_file, source_sha256, extracted_at, changes)
-                VALUES (%s, %s, %s, %s, %s)
+                    (course_id, source_file, source_sha256, extracted_at, changes, admin_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (course_id, draft["source_file"], draft["source_sha256"], draft["extracted_at"],
                  Jsonb(jsonable_encoder({
                      "target": "new" if current is None else "existing",
                      "fields": changes, "batches_added": added, "seat_reports": seat_reports,
-                 }))),
+                 })), admin["id"]),
             )
     except psycopg.errors.UniqueViolation:
         raise HTTPException(
@@ -1172,3 +1268,39 @@ def apply_course_draft(request: ApplyDraft):
         saved = None
     return {"course": saved, "changes": changes, "batches_added": added,
             "seat_reports": seat_reports}
+
+# Recent changes for the admin changes page, newest first: PDF course
+# updates, and seat reports not from a PDF (those are part of their update).
+CHANGES_LIMIT = 100
+
+@admin_router.get("/api/changes")
+def list_changes():
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            rows = cur.execute(
+                """
+                SELECT 'course_update' AS kind, u.applied_at AS at, a.name AS admin,
+                       c.name AS course, c.code, u.source_file, u.changes,
+                       NULL::date AS start_date, NULL::date AS end_date,
+                       NULL::integer AS seats_available, NULL::text AS source
+                FROM course_updates u
+                JOIN courses c ON c.id = u.course_id
+                LEFT JOIN admins a ON a.id = u.admin_id
+                UNION ALL
+                SELECT 'seat_report', s.reported_at, a.name, c.name, c.code, NULL, NULL,
+                       b.start_date, b.end_date, s.seats_available, s.source
+                FROM seat_availability s
+                JOIN course_batches b ON b.id = s.batch_id
+                JOIN courses c ON c.id = b.course_id
+                LEFT JOIN admins a ON a.id = s.recorded_by_admin_id
+                WHERE s.source <> 'pdf'
+                ORDER BY at DESC
+                LIMIT %s
+                """,
+                (CHANGES_LIMIT,),
+            ).fetchall()
+    except DB_ERRORS:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return {"changes": rows}
+
+app.include_router(admin_router)

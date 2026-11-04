@@ -46,7 +46,14 @@
   }
   .bar svg { width: 30px; height: 30px; flex: none; }
   .bar h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: 0.04em; }
-  .bar a { margin-left: auto; font-size: 13px; color: #b9cde0; }
+  .nav { margin-left: auto; display: flex; align-items: center; gap: 14px; }
+  .nav a { font-size: 13px; color: #b9cde0; }
+  .nav button {
+    font: inherit; font-size: 13px; font-weight: 400; height: auto; color: #fff;
+    background: transparent; border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 8px; padding: 5px 12px;
+  }
+  .nav button:hover { background: transparent; border-color: #fff; }
 
   main { max-width: 820px; margin: 0 auto; padding: 24px 16px 40px; }
   h2 { color: var(--navy); font-size: 20px; font-weight: 600; margin: 0 0 4px; }
@@ -132,7 +139,11 @@
       <path d="M3 14.5l1.5-1 1.5 1M18 14.5l1.5-1 1.5 1"/>
     </svg>
     <h1>Anchor</h1>
-    <a href="/">Back to chat</a>
+    <nav class="nav">
+      <a href="/admin/changes">Changes</a>
+      <a href="/">Chat</a>
+      <form method="post" action="/admin/logout"><button type="submit">Log out</button></form>
+    </nav>
   </div>
 </header>
 
@@ -224,6 +235,10 @@ async function post(url, options) {
     response = await fetch(url, {method: "POST", ...options});
   } catch {
     throw new Error("Couldn't reach the server. Is it running?");
+  }
+  if (response.status === 401) {
+    location.assign("/admin/login?next=" + encodeURIComponent("/admin/upload"));
+    throw new Error("Your session has ended. Log in again.");
   }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {

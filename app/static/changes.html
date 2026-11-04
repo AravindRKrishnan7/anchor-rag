@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anchor · Recent changes</title>
+<style>
+  :root {
+    --navy: #0b2540;
+    --navy-2: #12345a;
+    --teal: #1f7a8c;
+    --teal-dark: #17606e;
+    --sand: #f4efe6;
+    --ink: #1b2733;
+    --muted: #5f6f7f;
+    --line: #dfe5ea;
+    --card: #ffffff;
+    --error-bg: #fdf0ee;
+    --error-ink: #9b2c1f;
+    --change-bg: #e8f4f6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--sand);
+    color: var(--ink);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  header {
+    background: linear-gradient(135deg, var(--navy), var(--navy-2));
+    color: #fff;
+    border-bottom: 3px solid var(--teal);
+  }
+  .bar {
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 14px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .bar svg { width: 30px; height: 30px; flex: none; }
+  .bar h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: 0.04em; }
+  .nav { margin-left: auto; display: flex; align-items: center; gap: 14px; }
+  .nav a { font-size: 13px; color: #b9cde0; }
+  .nav button {
+    font: inherit; font-size: 13px; color: #fff; cursor: pointer;
+    background: transparent; border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 8px; padding: 5px 12px;
+  }
+  .nav button:hover { border-color: #fff; }
+
+  main { max-width: 1000px; margin: 0 auto; padding: 24px 16px 40px; }
+  h2 { color: var(--navy); font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .lead { color: var(--muted); margin: 0 0 18px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 6px 18px;
+    box-shadow: 0 1px 2px rgba(11, 37, 64, 0.05);
+  }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; }
+  td.when { white-space: nowrap; color: var(--muted); font-size: 14px; }
+  .kind { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--change-bg); color: var(--teal-dark); margin: 0 0 4px; }
+  .kind.seats { background: var(--line); color: var(--muted); }
+  ul { margin: 0; padding-left: 18px; }
+  .muted { color: var(--muted); }
+  .note { border-radius: 10px; padding: 10px 14px; margin: 12px 0; background: var(--error-bg); color: var(--error-ink); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="5" r="2.2"/>
+      <path d="M12 7.2V21"/>
+      <path d="M8 11h8"/>
+      <path d="M4.5 13.5a7.5 7.5 0 0 0 15 0"/>
+      <path d="M3 14.5l1.5-1 1.5 1M18 14.5l1.5-1 1.5 1"/>
+    </svg>
+    <h1>Anchor</h1>
+    <nav class="nav">
+      <a href="/admin/upload">Upload PDF</a>
+      <a href="/">Chat</a>
+      <form method="post" action="/admin/logout"><button type="submit">Log out</button></form>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <h2>Recent changes</h2>
+  <p class="lead">Course updates from PDFs and seat counts, newest first.</p>
+  <div class="note" id="error" hidden></div>
+  <div class="card">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>When</th><th>What changed</th><th>Course / batch</th><th>Admin</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<script>
+const LABELS = {name: "Name", code: "Code", duration_days: "Duration", fee_inr: "Fee"};
+const SOURCES = {manual: "entered by staff", form: "web form", sync: "institute sync"};
+
+function el(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+
+function format(field, value) {
+  if (value === null || value === undefined) return "—";
+  if (field === "fee_inr") return "₹" + Number(value).toLocaleString("en-IN");
+  if (field === "duration_days") return `${value} days`;
+  return String(value);
+}
+
+function day(iso) {
+  return new Date(iso + "T00:00:00").toLocaleDateString("en-IN", {day: "numeric", month: "short", year: "numeric"});
+}
+
+function when(iso) {
+  return new Date(iso).toLocaleString("en-IN", {day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit"});
+}
+
+function courseUpdate(change) {
+  const c = change.changes || {};
+  const cell = document.createElement("td");
+  cell.appendChild(el("span", c.target === "new" ? "New course from PDF" : "Course updated from PDF", "kind"));
+  const items = [];
+  for (const [field, f] of Object.entries(c.fields || {})) {
+    items.push(c.target === "new"
+      ? `${LABELS[field] || field}: ${format(field, f.new)}`
+      : `${LABELS[field] || field}: ${format(field, f.old)} → ${format(field, f.new)}`);
+  }
+  for (const b of c.batches_added || []) {
+    items.push(`Batch added: ${day(b.start_date)} – ${day(b.end_date)}, ${b.capacity} seats` +
+      (b.capacity_entered ? " (capacity entered by admin)" : ""));
+  }
+  for (const s of c.seat_reports || []) {
+    items.push(`Seats open set to ${s.seats_available} for ${day(s.start_date)} – ${day(s.end_date)}`);
+  }
+  const ul = el("ul");
+  for (const item of items) ul.appendChild(el("li", item));
+  cell.append(ul, el("div", `From ${change.source_file}`, "muted"));
+  return cell;
+}
+
+function seatReport(change) {
+  const cell = document.createElement("td");
+  cell.appendChild(el("span", "Seat count", "kind seats"));
+  cell.appendChild(el("div", `Seats open set to ${change.seats_available} (${SOURCES[change.source] || change.source})`));
+  return cell;
+}
+
+async function load() {
+  const rows = document.getElementById("rows");
+  let response;
+  try {
+    response = await fetch("/admin/api/changes");
+  } catch {
+    rows.replaceChildren();
+    return showError("Couldn't reach the server. Is it running?");
+  }
+  if (response.status === 401) {
+    location.assign("/admin/login?next=" + encodeURIComponent("/admin/changes"));
+    return;
+  }
+  const data = await response.json().catch(() => ({}));
+  rows.replaceChildren();
+  if (!response.ok) return showError(typeof data.detail === "string" ? data.detail : `Request failed (${response.status})`);
+  if (!data.changes.length) {
+    const td = el("td", "No changes yet.", "muted");
+    td.colSpan = 4;
+    rows.appendChild(el("tr")).appendChild(td);
+    return;
+  }
+  for (const change of data.changes) {
+    const tr = el("tr");
+    const course = change.code ? `${change.course} (${change.code})` : change.course;
+    const target = el("td", course);
+    if (change.kind === "seat_report") {
+      target.appendChild(el("div", `Batch ${day(change.start_date)} – ${day(change.end_date)}`, "muted"));
+    }
+    tr.append(
+      el("td", when(change.at), "when"),
+      change.kind === "course_update" ? courseUpdate(change) : seatReport(change),
+      target,
+      change.admin ? el("td", change.admin) : el("td", "— (before admin login)", "muted"),
+    );
+    rows.appendChild(tr);
+  }
+}
+
+function showError(message) {
+  const error = document.getElementById("error");
+  error.textContent = message;
+  error.hidden = false;
+}
+
+load();
+</script>
+</body>
+</html>

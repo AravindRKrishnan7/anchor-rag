@@ -11,7 +11,7 @@ INSERT INTO organizations (id, name, org_type, country) VALUES
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO people (id, name, role, services, location, bio) VALUES
-    (1, 'Captain Ravi Menon', 'Chief Engineer', ARRAY['ship maintenance', 'engine overhaul'],
+    (1, 'Ravi Menon', 'Chief Engineer', ARRAY['ship maintenance', 'engine overhaul'],
         'Kochi', 'Marine engineer with 20+ years on tankers and bulk carriers.'),
     (2, 'Anita Thomas', 'Port Consultant', ARRAY['port operations', 'terminal planning'],
         'Kochi', 'Advises terminals on berth scheduling and cargo throughput.'),

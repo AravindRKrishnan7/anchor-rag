@@ -1,8 +1,9 @@
 import os
 
 from dotenv import load_dotenv
+import psycopg
 from psycopg.conninfo import make_conninfo
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 load_dotenv()
 
@@ -17,3 +18,6 @@ conninfo = make_conninfo(
 
 # Opened in the app lifespan so startup doesn't fail if the DB is down.
 pool = ConnectionPool(conninfo, min_size=1, max_size=5, open=False, timeout=3)
+
+# What a failed query raises: a database error, or no free connection in time.
+DB_ERRORS = (psycopg.Error, PoolTimeout)
