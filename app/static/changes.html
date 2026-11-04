@@ -101,12 +101,12 @@
 
 <main>
   <h2>Recent changes</h2>
-  <p class="lead">Course updates from PDFs and seat counts, newest first.</p>
+  <p class="lead">Course updates, seat counts and chatbot content, newest first.</p>
   <div class="note" id="error" hidden></div>
   <div class="card">
     <div class="table-wrap">
       <table>
-        <thead><tr><th>When</th><th>What changed</th><th>Course / batch</th><th>Admin</th></tr></thead>
+        <thead><tr><th>When</th><th>What changed</th><th>About</th><th>Admin</th></tr></thead>
         <tbody id="rows"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
       </table>
     </div>
@@ -162,6 +162,21 @@ function courseUpdate(change) {
   return cell;
 }
 
+function contentChange(change) {
+  const c = change.changes || {};
+  const published = change.kind === "content_published";
+  const cell = document.createElement("td");
+  const what = c.type === "document" ? "Document" : "Interview";
+  cell.appendChild(el("span", `${what} ${published ? "published" : "unpublished"}`, published ? "kind" : "kind seats"));
+  cell.appendChild(el("div", `“${c.title}”`));
+  if (published) {
+    cell.appendChild(el("div", c.consent_given_by ? `Consent given by ${c.consent_given_by}` : "No consent record (loaded by script)", "muted"));
+  } else {
+    cell.appendChild(el("div", "Removed from the chatbot", "muted"));
+  }
+  return cell;
+}
+
 function seatReport(change) {
   const cell = document.createElement("td");
   cell.appendChild(el("span", "Seat count", "kind seats"));
@@ -200,7 +215,8 @@ async function load() {
     }
     tr.append(
       el("td", when(change.at), "when"),
-      change.kind === "course_update" ? courseUpdate(change) : seatReport(change),
+      change.kind === "course_update" ? courseUpdate(change)
+        : change.kind === "seat_report" ? seatReport(change) : contentChange(change),
       target,
       change.admin ? el("td", change.admin) : el("td", "— (before admin login)", "muted"),
     );

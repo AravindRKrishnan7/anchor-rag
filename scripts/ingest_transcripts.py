@@ -6,42 +6,19 @@ Each file in transcripts/ starts with "key: value" header lines (person_id,
 title, date), a blank line, then "Speaker: text" turns. Every answer (any
 speaker but the interviewer) becomes one chunk. Files are keyed by name, so
 re-running replaces a file's chunks instead of duplicating them, and files
-whose text and embedding model are unchanged are skipped.
+whose text and embedding model are unchanged are skipped. Interviews an
+admin unpublished (consent withdrawn) are never loaded again.
 """
 
 import hashlib
-import re
 import sys
 from pathlib import Path
 
 from app.db import pool
-from app.embeddings import EMBED_MODEL, embed_documents, to_pgvector
+from app.embeddings import EMBED_MODEL, embed_documents
+from app.ingest import INTERVIEWER, is_guest, parse_transcript, store_chunks
 
 TRANSCRIPTS_DIR = Path(__file__).resolve().parent.parent / "transcripts"
-INTERVIEWER = "Interviewer"
-TURN = re.compile(r"^([A-Z][\w .'-]*?):\s*(.*)$")
-
-def parse_transcript(text: str) -> tuple[dict, list[tuple[str, str]]]:
-    header_text, _, body = text.partition("\n\n")
-    header = {}
-    for line in header_text.splitlines():
-        key, _, value = line.partition(":")
-        header[key.strip()] = value.strip()
-    turns = []
-    for line in body.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        match = TURN.match(line)
-        if match:
-            turns.append((match[1], match[2]))
-        elif turns:
-            # Continuation line: join it to the previous turn.
-            speaker, said = turns[-1]
-            turns[-1] = (speaker, f"{said} {line}")
-        else:
-            raise ValueError(f"Text before the first speaker: {line!r}")
-    return header, turns
 
 def ingest_file(path: Path) -> str:
     text = path.read_text()
@@ -60,7 +37,7 @@ def ingest_file(path: Path) -> str:
         if person is None:
             raise ValueError(f"{path.name}: person {person_id} not in database")
         # Catches a header pointing at the wrong person.
-        if any(speaker not in person[0] for speaker in speakers):
+        if not all(is_guest(speaker, person[0]) for speaker in speakers):
             raise ValueError(
                 f"{path.name}: speakers {sorted(speakers)} don't match person "
                 f"{person_id} ({person[0]})"
@@ -69,7 +46,8 @@ def ingest_file(path: Path) -> str:
         existing = conn.execute(
             """
             SELECT i.content_hash,
-                   bool_and(c.embedding_model = %s) AS same_model
+                   bool_and(c.embedding_model = %s) AS same_model,
+                   i.unpublished_at IS NOT NULL AS unpublished
             FROM interviews i
             LEFT JOIN chunks c ON c.interview_id = i.id
             WHERE i.source_file = %s
@@ -77,6 +55,8 @@ def ingest_file(path: Path) -> str:
             """,
             (EMBED_MODEL, path.name),
         ).fetchone()
+        if existing and existing[2]:
+            return "skipped: unpublished by an admin"
         if existing and existing[0] == content_hash and existing[1]:
             return "unchanged"
 
@@ -84,8 +64,9 @@ def ingest_file(path: Path) -> str:
         embeddings = embed_documents(answers)
         interview_id = conn.execute(
             """
-            INSERT INTO interviews (person_id, title, interviewed_on, source_file, content_hash)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO interviews
+                (person_id, title, interviewed_on, source_file, content_hash, published_at)
+            VALUES (%s, %s, %s, %s, %s, now())
             ON CONFLICT (source_file) DO UPDATE SET
                 person_id = EXCLUDED.person_id,
                 title = EXCLUDED.title,
@@ -97,17 +78,8 @@ def ingest_file(path: Path) -> str:
         ).fetchone()[0]
         conn.execute("DELETE FROM chunks WHERE interview_id = %s", (interview_id,))
         with conn.cursor() as cur:
-            cur.executemany(
-                """
-                INSERT INTO chunks
-                    (interview_id, person_id, chunk_index, content, embedding, embedding_model)
-                VALUES (%s, %s, %s, %s, %s::vector, %s)
-                """,
-                [
-                    (interview_id, person_id, i, answer, to_pgvector(vector), EMBED_MODEL)
-                    for i, (answer, vector) in enumerate(zip(answers, embeddings))
-                ],
-            )
+            store_chunks(cur, answers, embeddings, interview_id=interview_id,
+                         person_id=person_id)
     return f"inserted {len(answers)} chunks"
 
 def main() -> int:

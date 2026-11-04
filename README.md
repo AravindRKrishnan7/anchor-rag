@@ -13,6 +13,22 @@ prompt, at least 12 characters, and only its scrypt hash is stored):
 Then log in at http://localhost:8000/admin/login. Sessions last 8 hours. Every
 PDF update and seat report records which admin made it.
 
+## Add interviews and company documents
+
+At http://localhost:8000/admin/add-content (dashboard → **Add interviews &
+documents**) an admin can paste or upload an interview transcript (`Speaker:
+text` turns; only the guest's answers are added) or upload a company PDF. The
+preview shows the detected person or organization, the passages the chatbot
+will search and any duplicates. Publishing requires confirming the guest's or
+company's consent and records who gave it, when, and which admin. It needs
+Ollama running to embed the passages.
+
+**Unpublish** (e.g. consent withdrawn) deletes the passages from search and
+keeps a record; a person added from this page is also hidden from the chatbot
+when no other interview of theirs is published. `scripts/ingest_transcripts.py`
+never re-adds unpublished interviews. Demo transcript:
+`samples/interview-asha-rao.txt`.
+
 ## Update a course from a PDF
 
 Open http://localhost:8000/admin/upload, choose a course PDF and click **Read PDF**.

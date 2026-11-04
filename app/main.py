@@ -1,5 +1,4 @@
 import hashlib
-import io
 import json
 import os
 import re
@@ -14,7 +13,6 @@ from typing import Literal
 from urllib.parse import quote
 
 import psycopg
-import pypdf
 from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, RedirectResponse
@@ -26,6 +24,8 @@ from app.auth import LoginRequired, require_admin, require_admin_page
 from app.auth import router as auth_router
 from app.db import DB_ERRORS, pool
 from app.embeddings import EMBED_MODEL, embed_query, to_pgvector
+from app import content
+from app.ingest import pdf_text
 
 # Seat counts older than these are flagged so clients can warn users.
 SEATS_FRESH_FOR = timedelta(days=1)
@@ -97,7 +97,9 @@ def db_health():
 def fetch_person(person_id: int) -> dict | None:
     with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
         person = cur.execute(
-            "SELECT id, name, role, services, location, bio FROM people WHERE id = %s",
+            # People hidden after withdrawing consent are left out everywhere.
+            "SELECT id, name, role, services, location, bio FROM people "
+            "WHERE id = %s AND chat_hidden_at IS NULL",
             (person_id,),
         ).fetchone()
         if person is not None:
@@ -276,8 +278,10 @@ search first with a few short keywords (a name, role, service, course name or \
 code), then look up details by the ID you found. The directory records which institute offers each course, \
 not who teaches it. Seat counts include how fresh they are: say so when one is \
 "aging" or "stale", and say seats are unknown when there is no report. \
-For what people have said about their work, experience or advice, use \
-search_documents and attribute each point to the person who said it. \
+For what people have said about their work, experience or advice, or what an \
+organization's documents say, use search_documents. Attribute each point to the \
+person who said it, or to the organization and its document ("Kochi Maritime \
+Academy's course guide says..."). \
 Give the answer itself, not where it came from: don't mention the profiles, \
 searches, tools or databases, and don't comment on whether a search was useful. \
 Today is {today}.
@@ -293,7 +297,7 @@ Profiles:
 QUOTE_MIN_WORDS = 3
 INLINE_QUOTE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
 BLOCK_QUOTE = re.compile(r"^(>\s?)(.*)$", re.M)
-UNVERIFIED_QUOTE = "[quote removed: not found in the interview transcripts]"
+UNVERIFIED_QUOTE = "[quote removed: not found in the interviews or documents]"
 # "(ID 1)", "(person ID: 1)", then any remaining "course ID 456".
 ID_IN_PARENS = re.compile(r"\s*\((?:person |course |batch )?IDs? ?:? ?#?\d+\)", re.I)
 ID_MENTION = re.compile(r"\s*\b(?:person |course |batch )?IDs? ?:? ?#?\d+\b", re.I)
@@ -333,10 +337,12 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "search_documents",
-            "description": "Search interview transcripts for what maritime professionals "
-            "said about a topic: experiences, opinions, advice. Matches by meaning, so "
-            "describe the topic in a short phrase or question. Returns up to "
-            f"{CHAT_SEARCH_LIMIT} passages with the speaker's name and interview title.",
+            "description": "Search interview transcripts and company documents for a "
+            "topic: what maritime professionals said (experiences, opinions, advice) "
+            "and what organizations' documents say (courses, services, policies). "
+            "Matches by meaning, so describe the topic in a short phrase or question. "
+            f"Returns up to {CHAT_SEARCH_LIMIT} passages, each with either the speaker "
+            "and interview title or the organization and document title.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Topic or question"}},
@@ -384,7 +390,7 @@ def search_people(query: str) -> dict:
             f"""
             SELECT p.id, p.name, p.role, p.services, p.location
             FROM people p, {SEARCH_ANY_WORD} q
-            WHERE p.search @@ q
+            WHERE p.search @@ q AND p.chat_hidden_at IS NULL
             ORDER BY ts_rank(p.search, q) DESC, p.id
             LIMIT %s
             """,
@@ -440,18 +446,31 @@ def search_documents(query: str) -> dict:
                 FROM vec FULL OUTER JOIN fts ON fts.id = vec.id
             )
             SELECT c.id AS chunk_id, p.id AS person_id, p.name AS person_name,
-                   i.title AS interview_title, i.interviewed_on, c.content AS text,
-                   round(f.score, 4) AS score
+                   i.title AS interview_title, i.interviewed_on, i.video_url,
+                   o.name AS organization, d.title AS document_title,
+                   c.content AS text, round(f.score, 4) AS score
             FROM fused f
             JOIN chunks c ON c.id = f.id
-            JOIN people p ON p.id = c.person_id
-            JOIN interviews i ON i.id = c.interview_id
+            LEFT JOIN people p ON p.id = c.person_id
+            LEFT JOIN interviews i ON i.id = c.interview_id
+            LEFT JOIN organizations o ON o.id = c.organization_id
+            LEFT JOIN documents d ON d.id = c.document_id
             ORDER BY f.score DESC, c.id
             LIMIT %(limit)s
             """,
             {"vector": vector, "model": EMBED_MODEL, "query": query,
              "candidates": DOCUMENT_CANDIDATES, "k": RRF_K, "limit": CHAT_SEARCH_LIMIT},
         ).fetchall()
+    # Each passage is from an interview or a company document; leave out the
+    # other kind's empty fields so the model isn't shown null speakers.
+    interview_keys = ("person_id", "person_name", "interview_title", "interviewed_on", "video_url")
+    document_keys = ("organization", "document_title")
+    for match in matches:
+        drop = document_keys if match["interview_title"] is not None else interview_keys
+        for key in drop:
+            match.pop(key)
+        if match.get("video_url") is None:
+            match.pop("video_url", None)
     return {"matches": matches}
 
 # Tool name -> (query function, argument name, argument type, not-found message).
@@ -518,7 +537,8 @@ def load_chat_profiles() -> str:
             FROM people p
             LEFT JOIN employment e ON e.person_id = p.id
             LEFT JOIN organizations o ON o.id = e.organization_id
-            ORDER BY p.id, e.end_date IS NOT NULL, e.start_date DESC
+            WHERE p.chat_hidden_at IS NULL
+            ORDER BY p.id, e.end_date IS NOT NULL, e.start_date DESC NULLS LAST
             """
         ).fetchall()
     people = {}
@@ -526,11 +546,13 @@ def load_chat_profiles() -> str:
         person = people.setdefault(row["id"], {**row, "jobs": []})
         if row["title"] is not None:
             # "current"/"former" spelled out: models read "since 2022" as ended.
-            when = (
-                f"former, {row['start_date'].year}-{row['end_date'].year}"
-                if row["end_date"]
-                else f"current, since {row['start_date'].year}"
-            )
+            # Jobs added from the browser may have no start date.
+            start = row["start_date"].year if row["start_date"] else None
+            if row["end_date"]:
+                when = (f"former, {start}-{row['end_date'].year}" if start
+                        else f"former, until {row['end_date'].year}")
+            else:
+                when = f"current, since {start}" if start else "current"
             person["jobs"].append(
                 f"{row['title']} at {row['organization']} ({row['org_type']}) ({when})"
             )
@@ -554,6 +576,11 @@ def get_chat_profiles() -> str:
     if chat_profiles is None:
         chat_profiles = load_chat_profiles()
     return chat_profiles
+
+# Called when people are added or hidden, so the next chat sees the change.
+def reset_chat_profiles():
+    global chat_profiles
+    chat_profiles = None
 
 def normalize_quote(text: str) -> str:
     text = text.translate({0x2018: "'", 0x2019: "'", 0x201C: '"', 0x201D: '"'})
@@ -707,7 +734,9 @@ def chat(request: ChatRequest):
         tool_calls.append({"name": name, "arguments": arguments, "automatic": automatic})
         if name == "search_documents":
             for match in result.get("matches", []):
-                quote_sources.extend([match["text"], match["interview_title"]])
+                quote_sources.extend([
+                    match["text"], match.get("interview_title") or match.get("document_title"),
+                ])
         messages.append(
             {
                 "role": "tool",
@@ -848,13 +877,6 @@ class ExtractedCourse(BaseModel):
     @classmethod
     def null_batches(cls, value):
         return [] if value is None else value
-
-def pdf_text(data: bytes) -> str:
-    try:
-        reader = pypdf.PdfReader(io.BytesIO(data))
-        return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
-    except pypdf.errors.PyPdfError:
-        raise HTTPException(status_code=422, detail="Could not read this PDF")
 
 def extract_course(text: str) -> ExtractedCourse:
     reply = deepseek_chat(
@@ -1278,7 +1300,8 @@ def apply_course_draft(request: ApplyDraft, admin: dict = Depends(require_admin)
             "seat_reports": seat_reports}
 
 # Recent changes for the admin changes page, newest first: PDF course
-# updates, and seat reports not from a PDF (those are part of their update).
+# updates, seat reports not from a PDF (those are part of their update), and
+# interviews and documents published or unpublished.
 CHANGES_LIMIT = 100
 
 @admin_router.get("/api/changes")
@@ -1302,6 +1325,39 @@ def list_changes():
                 JOIN courses c ON c.id = b.course_id
                 LEFT JOIN admins a ON a.id = s.recorded_by_admin_id
                 WHERE s.source <> 'pdf'
+                UNION ALL
+                SELECT 'content_published', coalesce(i.published_at, i.created_at), a.name,
+                       p.name, NULL, NULL,
+                       jsonb_build_object('type', 'interview', 'title', i.title,
+                                          'consent_given_by', i.consent_given_by),
+                       NULL, NULL, NULL, NULL
+                FROM interviews i
+                JOIN people p ON p.id = i.person_id
+                LEFT JOIN admins a ON a.id = i.published_by_admin_id
+                UNION ALL
+                SELECT 'content_unpublished', i.unpublished_at, a.name, p.name, NULL, NULL,
+                       jsonb_build_object('type', 'interview', 'title', i.title),
+                       NULL, NULL, NULL, NULL
+                FROM interviews i
+                JOIN people p ON p.id = i.person_id
+                LEFT JOIN admins a ON a.id = i.unpublished_by_admin_id
+                WHERE i.unpublished_at IS NOT NULL
+                UNION ALL
+                SELECT 'content_published', d.published_at, a.name, o.name, NULL, NULL,
+                       jsonb_build_object('type', 'document', 'title', d.title,
+                                          'consent_given_by', d.consent_given_by),
+                       NULL, NULL, NULL, NULL
+                FROM documents d
+                JOIN organizations o ON o.id = d.organization_id
+                LEFT JOIN admins a ON a.id = d.published_by_admin_id
+                UNION ALL
+                SELECT 'content_unpublished', d.unpublished_at, a.name, o.name, NULL, NULL,
+                       jsonb_build_object('type', 'document', 'title', d.title),
+                       NULL, NULL, NULL, NULL
+                FROM documents d
+                JOIN organizations o ON o.id = d.organization_id
+                LEFT JOIN admins a ON a.id = d.unpublished_by_admin_id
+                WHERE d.unpublished_at IS NOT NULL
                 ORDER BY at DESC
                 LIMIT %s
                 """,
@@ -1312,3 +1368,5 @@ def list_changes():
     return {"changes": rows}
 
 app.include_router(admin_router)
+content.directory_listeners.append(reset_chat_profiles)
+app.include_router(content.router)
