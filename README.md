@@ -1,5 +1,7 @@
 # ANchor
 
+Deploying for free (Render + Supabase + Nomic embeddings): see [docs/DEPLOY.md](docs/DEPLOY.md).
+
 ## Admin login
 
 Course PDF uploads (`/admin/upload`), seat reports and the change log

@@ -7,7 +7,6 @@ confirms the guest's or company's consent and publishes. Unpublishing
 """
 
 import re
-import urllib.error
 import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
@@ -22,7 +21,7 @@ from pydantic import BaseModel
 
 from app.auth import require_admin_page
 from app.db import DB_ERRORS, pool
-from app.embeddings import embed_documents
+from app.embeddings import EmbeddingError, embed_documents
 from app.ingest import (
     INTERVIEWER, answer_chunks, content_hash, is_guest, parse_turns, pdf_text, split_header,
     store_chunks, text_chunks,
@@ -45,7 +44,6 @@ EARLIEST_YEAR = 1950
 YOUTUBE_URL = re.compile(
     r"^https://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|shorts/|live/)|youtu\.be/)[\w-]{6,}\S*$"
 )
-EMBED_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError)
 # Prefix of interviews.source_file for browser uploads; other rows came
 # from scripts/ingest_transcripts.py.
 UPLOAD_SOURCE = "admin/"
@@ -394,12 +392,12 @@ def publish_content(request: Publish, admin: dict = Depends(require_admin_page))
     if drafts.pop(request.draft_id, None) is None:
         raise HTTPException(status_code=404, detail="Preview not found or expired; preview it again")
 
-    # Embedded before anything is written, so an Ollama failure saves nothing.
+    # Embedded before anything is written, so a provider failure saves nothing.
     try:
         vectors = embed_documents(draft["chunks"])
-    except EMBED_ERRORS:
+    except EmbeddingError as e:
         drafts[request.draft_id] = draft
-        raise HTTPException(status_code=503, detail="Embedding service (Ollama) unavailable; nothing was saved")
+        raise HTTPException(status_code=503, detail=f"{e}; nothing was saved, try again")
 
     source_file = f"{UPLOAD_SOURCE}{request.draft_id}/{draft['source_name']}"
     try:

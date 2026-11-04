@@ -1,0 +1,30 @@
+# Render Blueprint for the Anchor web app (free web service).
+# Secrets are marked sync: false: Render asks for them when the Blueprint is
+# created and they are never stored in git. See docs/DEPLOY.md.
+services:
+  - type: web
+    name: anchor
+    runtime: python
+    plan: free
+    # Closest Render region to the Supabase project (ap-northeast-2, Seoul).
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    # One process only: PDF drafts, content previews and login lockouts are
+    # kept in memory. --proxy-headers takes the client IP and https from
+    # Render's proxy (it is the only thing that can reach the app).
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.14.6
+      - key: EMBEDDINGS_PROVIDER
+        value: nomic
+      - key: ADMIN_COOKIE_SECURE
+        value: "true"
+      - key: DATABASE_URL
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: NOMIC_API_KEY
+        sync: false

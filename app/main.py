@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 from app.auth import LoginRequired, require_admin, require_admin_page
 from app.auth import router as auth_router
 from app.db import DB_ERRORS, pool
-from app.embeddings import EMBED_MODEL, embed_query, to_pgvector
+from app.embeddings import EMBED_MODEL, EmbeddingError, embed_query, to_pgvector
 from app import content
 from app.ingest import pdf_text
 
@@ -497,7 +497,11 @@ def run_chat_tool(name: str, arguments: dict | None) -> dict:
     if key is None or key == "":
         kind = "an integer" if arg_type is int else "a non-empty string"
         return {"error": f"{name} needs {kind} {arg}"}
-    result = fetch(key)
+    try:
+        result = fetch(key)
+    except EmbeddingError:
+        # Courses and people still work; tell the model only search is down.
+        return {"error": "Interview and document search is unavailable right now"}
     return result if result is not None else {"error": not_found}
 
 def deepseek_chat(
