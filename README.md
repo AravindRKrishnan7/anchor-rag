@@ -1,57 +1,113 @@
-# ANchor
+# Anchor
 
-Deploying for free (Render + Supabase + Nomic embeddings): see [docs/DEPLOY.md](docs/DEPLOY.md).
+Anchor is a chatbot and admin tool for a maritime network of people,
+ship managers and training institutes. Ask it in plain language who works
+where, which courses have seats, or what people said in interviews.
 
-## Admin login
+**Live demo:** https://anchor-qe39.onrender.com. It runs on free hosting, so
+the first visit after a quiet spell takes about a minute to wake up.
 
-Course PDF uploads (`/admin/upload`), seat reports and the change log
-(`/admin/changes`) need an admin login; the chat page and `/chat` stay public.
-Create an admin from the terminal (the password is asked for at a hidden
-prompt, at least 12 characters, and only its scrypt hash is stored):
+> All data in this repo (people, companies, courses, seat counts, interviews
+> and sample PDFs) is fictional sample data.
 
-    python -m scripts.create_admin
-    python -m scripts.create_admin --reset-password   # forgot it; logs out old sessions
+## What it does
 
-Then log in at http://localhost:8000/admin/login. Sessions last 8 hours. Every
-PDF update and seat report records which admin made it.
+- **People search**: who works where, in which role, and whether a job is
+  current or former.
+- **Live seat availability**: seats left in each course batch, with how fresh
+  the count is (`fresh` up to 1 day, `aging` up to 7 days, then `stale`). Who
+  reported the count is never shown.
+- **Interview answers with verified quotes**: answers drawn from interview
+  transcripts and company documents. A quote is kept only if it appears word
+  for word in the source passage.
+- **Course updates from a PDF**: an admin uploads a course brochure.
+  DeepSeek extracts the fee, duration and batches, and the admin reviews the
+  draft next to the current values. Nothing is saved until the admin
+  approves it.
+- **Add interviews and documents with consent**: paste a transcript or
+  upload a company PDF, preview the passages the chatbot will search, confirm
+  consent, then publish. **Unpublish** removes them from search and keeps a
+  record.
+- **Admin login and audit trail**: scrypt-hashed passwords, 8-hour sessions
+  and a login lockout. Every change records which admin made it, shown at
+  `/admin/changes`.
 
-## Add interviews and company documents
+## Architecture
 
-At http://localhost:8000/admin/add-content (dashboard → **Add interviews &
-documents**) an admin can paste or upload an interview transcript (`Speaker:
-text` turns; only the guest's answers are added) or upload a company PDF. The
-preview shows the detected person or organization, the passages the chatbot
-will search and any duplicates. Publishing requires confirming the guest's or
-company's consent and records who gave it, when, and which admin. It needs
-Ollama running to embed the passages.
+The core is a **FastAPI** app:
 
-**Unpublish** (e.g. consent withdrawn) deletes the passages from search and
-keeps a record; a person added from this page is also hidden from the chatbot
-when no other interview of theirs is published. `scripts/ingest_transcripts.py`
-never re-adds unpublished interviews. Demo transcript:
-`samples/interview-asha-rao.txt`.
+- It serves the pages: landing `/`, chat `/ask` and admin `/admin`.
+- `/chat` sends questions to **DeepSeek**, which answers by calling a small
+  set of tools that read the database.
+- The database is **Postgres with pgvector**, hosted on **Supabase**.
+  Structured facts (people, jobs, courses, batches, seats) live in ordinary
+  tables.
 
-## Update a course from a PDF
+Interviews and documents are split into passages and embedded with
+**nomic-embed-text** (through Nomic's API in production, or Ollama locally).
+Search over the passages is **hybrid**: vector similarity finds passages with
+the same meaning, and Postgres full-text search catches exact terms like
+"ECDIS". **Reciprocal Rank Fusion** (RRF) merges the two rankings.
 
-Open http://localhost:8000/admin/upload, choose a course PDF and click **Read PDF**.
-DeepSeek extracts the course fields (name, code, institute, duration, fee, batches)
-and the page shows them next to the current values. Nothing is saved until you click
-**Approve**, which applies the changes in one transaction and records the source PDF
-in `course_updates`. Fields the PDF doesn't state are left unchanged and values not
-found in the PDF text are dropped. 
-- If there's no exact code or name match but a course at the same institute has a
-  similar name or code, the draft lists it and you must choose **Update this
-  existing course** (its name and code are kept) or **Create as new course**.
-- A batch the PDF gives no capacity for needs one typed in before approving.
-- Seats available in the PDF are recorded as seat reports with source `pdf`, timed
-  at approval, so the chatbot shows them as fresh.
+The app is hosted on **Render**.
 
-`course_updates`, the `pdf` seat source and the admin tables were added to `db/init/02-schema.sql`.
-An existing database needs the schema re-run (it is safe to repeat):
+```mermaid
+flowchart LR
+    U[Browser] -->|HTTPS| R[FastAPI app<br/>on Render]
+    R -->|chat + tool calls| D[DeepSeek API]
+    R -->|embed passages and questions| N[Nomic embeddings API]
+    R -->|SQL over SSL| S[(Supabase Postgres<br/>+ pgvector)]
+    S --- T[Tables: people, jobs,<br/>courses, batches, seats]
+    S --- C[Passages + vectors<br/>hybrid search, RRF]
+```
 
-    docker compose exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < db/init/02-schema.sql
+## Key design decisions
 
-Demo file: `samples/basic-safety-training-2027.pdf` raises the Basic Safety Training
-fee to ₹19,500 and adds an 11–20 Jan 2027 batch (rebuild it with
-`python scripts/make_sample_pdf.py`). Undo it with `samples/reset-demo.sql`, piped
-into psql the same way.
+- **Facts go in tables, stories go in RAG.** Names, jobs, fees and seat
+  counts come from SQL, so they are exact and current. Only interview and
+  document passages go through vector search.
+- **Rules are enforced in code, not prompts.** The prompt asks the model to
+  behave, and code checks the result before it is sent:
+  - quotes not found in the sources are removed
+  - internal IDs are removed
+  - sentences about searches or tools are removed
+  - a seat reporter's name never reaches the model at all
+- **Never invent values.** If the data doesn't say, the answer is "I don't
+  have that information". The PDF importer drops any extracted value that
+  isn't in the PDF text, and leaves fields the PDF doesn't state unchanged.
+  A batch with no stated capacity needs one typed in.
+- **Consent and unpublish.** Interviews and documents can't be published
+  without recording who gave consent, when, and which admin. Unpublishing
+  deletes the passages from search but keeps the record. The ingest script
+  never re-adds an unpublished interview.
+
+## Run locally (Docker)
+
+You need Docker, Python 3.14, [Ollama](https://ollama.com) and a DeepSeek API
+key.
+
+    cp .env.example .env              # add DEEPSEEK_API_KEY; set POSTGRES_PASSWORD
+    docker compose up -d db           # Postgres + pgvector; loads schema and sample data
+    ollama pull nomic-embed-text
+    python -m venv .venv && source .venv/bin/activate
+    pip install -r requirements.txt
+    python -m scripts.ingest_transcripts
+    python -m scripts.create_admin    # asks for the password at a hidden prompt
+    uvicorn app.main:app --reload
+
+Open http://localhost:8000 and log in at `/admin/login`.
+
+**Demo files:**
+- `samples/basic-safety-training-2027.pdf` (course update)
+- `samples/interview-asha-rao.txt` (new interview)
+- `samples/reset-demo.sql` (undoes the course update)
+
+If your Docker database is older than the current schema,
+`db/init/02-schema.sql` is safe to re-run on it.
+
+## Deploy
+
+Deployment uses Render plus Supabase, both on free plans, with Nomic
+embeddings. The step-by-step guide is in [docs/DEPLOY.md](docs/DEPLOY.md). It
+covers secrets, environment variables, and what resets when the free service
+sleeps.
